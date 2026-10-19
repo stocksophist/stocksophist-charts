@@ -270,7 +270,7 @@ class Feed:
         newest-bar clock) and a rejected measurement is NEVER cached - the
         old code could lock in a wrong offset for a full hour when MT5
         handed back a stale tick on the first read, shifting every bar
-        (wrong axis times, broken day-boundary indicators like ORB).
+        (wrong axis times, broken day-boundary indicators).
         """
         if not self.live or mt5 is None:
             return 0
