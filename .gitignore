@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Runtime / user data (never commit)
+settings.json
+*.db
+*.db-wal
+*.db-shm
+*.log
+app/data/
+mt5_connection.json
+*.parquet
+
+# Test / build caches
+.pytest_cache/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
