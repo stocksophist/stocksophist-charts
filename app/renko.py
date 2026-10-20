@@ -36,7 +36,7 @@ class RenkoChain:
 
     A full rebuild re-anchors the ENTIRE brick series from bar 0, so a single
     revised M1 bar (tick-vault healing vs MT5 recovery routinely revise the
-    tail) shifts every later brick - and any signal plotted on those bricks
+    tail) shifts every later brick - and any overlay drawn on those bricks
     flickers ("coming and going"). A closed Renko brick is never revised,
     so neither do we: once a brick closes it is immutable; new bars
     only APPEND. Interior revisions of the M1 feed are ignored for bricks.
