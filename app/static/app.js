@@ -22,7 +22,7 @@
   var TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   var ALERT_TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   // premium-style deep history targets (bars) per timeframe
-  var APP_VERSION = "3.4.39";  // must match server VERSION; mismatch banner on load
+  var APP_VERSION = "3.4.41";  // must match server VERSION; mismatch banner on load
   var DEEP_BARS = { "1s": 7200, "15s": 5760,
                     "1m": 20000, "3m": 20000, "5m": 20000,
                     "15m": 20000, "30m": 20000, "1H": 20000, "4H": 20000,
@@ -1821,6 +1821,110 @@
   };
   Replay._svgPlay = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>';
   Replay._svgPause = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>';
+
+  /* --------------------------------- zoom-sync (v3.4.41)
+     Top-bar Zoom button. Arm it, then drag a box on ANY chart: every
+     chart zooms to that time range, each keeping its own timeframe.
+     One-shot (disarms after one drag); Esc cancels. View-only: it
+     never touches data, indicators or replay state. */
+  var ZoomSync = {
+    armed: false,
+    drag: null, // {pane, x0, y0, x1, el}
+
+    arm: function () {
+      if (this.armed) { this.disarm(); return; }
+      if (typeof Replay !== "undefined" && Replay.picking) Replay.cancelPick();
+      this.armed = true;
+      document.body.classList.add("zoom-armed");
+      var b = document.getElementById("btn-zoom");
+      if (b) b.classList.add("on");
+      toast("Zoom: drag a box on any chart - every chart zooms to that time range. Esc cancels.");
+    },
+    disarm: function () {
+      this.armed = false;
+      this._endDrag();
+      document.body.classList.remove("zoom-armed");
+      var b = document.getElementById("btn-zoom");
+      if (b) b.classList.remove("on");
+    },
+    /* pointer x (relative to the pane wrap) -> real bar time; on a
+       Renko pane coordinateToTime yields slot time, so map it back to
+       the brick's real formation time (same rule as toData()). */
+    timeAt: function (pane, x) {
+      var t = pane.chart.timeScale().coordinateToTime(x);
+      if (t === null || t === undefined) return null;
+      if (pane.state.mode === "renko" && pane.renkoReal) t = pane.renkoReal(t);
+      return t;
+    },
+    beginDrag: function (pane, e) {
+      var self = this;
+      var rr = pane.wrapEl.getBoundingClientRect();
+      var el = document.createElement("div");
+      el.className = "zoomsel";
+      pane.wrapEl.appendChild(el);
+      this.drag = { pane: pane, x0: e.clientX - rr.left, y0: e.clientY - rr.top, x1: 0, el: el };
+      this._paint(e);
+      var mv = function (ev) { self._paint(ev); };
+      var up = function (ev) {
+        document.removeEventListener("mousemove", mv, true);
+        document.removeEventListener("mouseup", up, true);
+        self._finish(ev);
+      };
+      document.addEventListener("mousemove", mv, true);
+      document.addEventListener("mouseup", up, true);
+    },
+    _paint: function (e) {
+      var d = this.drag; if (!d) return;
+      var rr = d.pane.wrapEl.getBoundingClientRect();
+      var x = e.clientX - rr.left, y = e.clientY - rr.top;
+      d.el.style.left = Math.min(d.x0, x) + "px";
+      d.el.style.top = Math.min(d.y0, y) + "px";
+      d.el.style.width = Math.abs(x - d.x0) + "px";
+      d.el.style.height = Math.abs(y - d.y0) + "px";
+      d.x1 = x;
+    },
+    _endDrag: function () {
+      if (this.drag && this.drag.el && this.drag.el.parentNode)
+        this.drag.el.parentNode.removeChild(this.drag.el);
+      this.drag = null;
+    },
+    _finish: function (e) {
+      var d = this.drag;
+      if (!d) { this.disarm(); return; }
+      var rr = d.pane.wrapEl.getBoundingClientRect();
+      var x1 = (e && e.clientX !== undefined) ? e.clientX - rr.left : d.x1;
+      var t0 = this.timeAt(d.pane, d.x0), t1 = this.timeAt(d.pane, x1);
+      this._endDrag();
+      this.disarm();
+      if (t0 === null || t1 === null) return;
+      if (t1 < t0) { var s = t0; t0 = t1; t1 = s; }
+      if (t1 - t0 < 30) { toast("Zoom: selection too small - drag a wider box."); return; }
+      this.apply(t0, t1);
+    },
+    apply: function (t0, t1) {
+      (Layout.panes || []).forEach(function (p) {
+        if (!p || !p.chart) return;
+        try {
+          if (p.state.mode === "renko" && p.bricks && p.bricks.length && p.renkoSlot) {
+            var s0 = p.renkoSlot(t0), s1 = p.renkoSlot(t1);
+            if (s0 < 1e9 && s1 < 1e9 && s1 > s0)
+              p.chart.timeScale().setVisibleRange({ from: s0, to: s1 });
+          } else {
+            p.chart.timeScale().setVisibleRange({ from: t0, to: t1 });
+          }
+        } catch (err) {}
+      });
+      toast("Zoomed all charts to the selected time range.");
+    },
+    init: function () {
+      var self = this;
+      var b = document.getElementById("btn-zoom");
+      if (b) b.addEventListener("click", function () { self.arm(); });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && self.armed) self.disarm();
+      });
+    }
+  };
 
   /* ------------------------------- UI theme
      data-theme on <html> drives all CSS tokens. Chart canvas colors come
@@ -3853,6 +3957,15 @@
       if (typeof Replay !== "undefined" && Replay.picking) {
         var rr = self.wrapEl.getBoundingClientRect();
         Replay.pick(self, e.clientX - rr.left, e.clientY - rr.top);
+        e.stopPropagation();
+        e.preventDefault();
+        return;
+      }
+      /* v3.4.41 zoom-sync: while armed, a drag on this pane selects the
+         time range every pane zooms to - swallow the gesture like the
+         replay pick so the chart never pans under the selection. */
+      if (typeof ZoomSync !== "undefined" && ZoomSync.armed) {
+        ZoomSync.beginDrag(self, e);
         e.stopPropagation();
         e.preventDefault();
         return;
@@ -6659,6 +6772,7 @@
       if (typeof NewsMarks !== "undefined") NewsMarks.init();  // news markers
       _serverHasTone(function () {});  // probe server custom tune once
       if (typeof Replay !== "undefined") Replay.init();
+      if (typeof ZoomSync !== "undefined") ZoomSync.init();  // v3.4.41 zoom-sync
       /* paint inline-SVG icons into [data-ic] placeholders, then
          apply the saved UI theme (charts follow via ChartSet defaults).*/
       try {

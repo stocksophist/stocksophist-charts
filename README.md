@@ -17,6 +17,10 @@ the Telegram API when you enable Telegram alerts).
   5m, 15m, 30m, 1H, 4H, D, W, M), plus Renko bricks built from the chart's
   own bars. Multiple chart panes side by side, drawings, bar replay, and
   saved layouts (including named layouts).
+- **Zoom-sync** — with two or more panes open, press the **Zoom** button
+  and drag a box on any chart: every chart zooms to that time range,
+  each keeping its own timeframe. Bar replay is synced across panes
+  too — start it on any chart and all panes step together.
 - **Indicators** — 17 standard textbook indicators (see
   [docs/INDICATORS.md](docs/INDICATORS.md)), each with full Inputs + Style
   settings that persist across restarts. Indicators are reference
@@ -27,21 +31,30 @@ the Telegram API when you enable Telegram alerts).
   the list. In MT5 mode the list follows the terminal's Market Watch; in
   OANDA mode additions persist in settings.
 - **Alerts** — the app's own alert system with price alerts and
-  indicator-condition alerts. Each alert is evaluated on the timeframe it
-  was created for, no matter which timeframe the chart currently shows.
-  When an alert triggers it is written to the alert log and delivered to
-  Telegram (if enabled) and/or an outbound webhook. Alerts notify you;
-  they do not place trades or send orders.
+  indicator-condition alerts (for example "RSI crosses above 70" or
+  "price crosses the EMA"). Each alert is evaluated on candle close, on
+  the timeframe it was created for, no matter which timeframe the chart
+  currently shows. When an alert triggers you get an on-screen popup and
+  a sound (pick a built-in tone or use your own `.wav`), it is written
+  to the alert log, and it is delivered to Telegram (if enabled) and/or
+  an outbound webhook. Alerts notify you; they do not place trades or
+  send orders.
+- **Drawing tools** — trend line, horizontal and vertical lines, ray,
+  rectangle, Fibonacci retracement, text labels and a measure tool,
+  with magnet snapping and per-drawing colour / width / style.
+  Drawings are saved with the layout.
 - **Data** — live quotes and history from MT5 (Windows) or OANDA; a local
   cache so reopening the app is fast; background jobs that keep history
   complete (gap healing, tick vault, deep-history sync). An economic
   calendar shows news events as display-only markers; news never gates
   signals or alerts.
 - **Chart trading (MT5)** — an explicit Trade panel lets you place
-  market/pending orders and manage SL/TP through the connected MT5
-  terminal. Trading is a separate, deliberate action: it is never
-  triggered by alerts or indicators, and it refuses to run when MT5 is
-  not live.
+  market, limit and stop orders and manage positions through the
+  connected MT5 terminal: lot presets, SL / TP in points, a one-tap
+  scalp mode, Close 50%, Reverse and Flatten All. Live trading first
+  has to be enabled per account inside the panel. Trading is a
+  separate, deliberate action: it is never triggered by alerts or
+  indicators, and it refuses to run when MT5 is not live.
 
 ## Tech stack
 
@@ -94,7 +107,40 @@ configuration.
 
 ## Screenshots
 
-Screenshots will be added here.
+All screenshots show the app running in DEMO mode with bundled history
+(no broker connected).
+
+**Main chart — candlesticks, watchlist and drawing toolbar**
+
+![Main chart](screenshots/main-chart.png)
+
+**Built-in indicators — 17 standard indicators with descriptions**
+
+![Indicators](screenshots/indicators.png)
+
+**Indicators on the chart — MACD and RSI with live values**
+
+![Indicators on the chart](screenshots/indicators-on-chart.png)
+
+**Chart layouts — 1, 2, 3 or 4 charts, named layouts you can save**
+
+![Chart layouts](screenshots/layouts.png)
+
+**Multi-chart — four panes side by side**
+
+![Multi-chart layout](screenshots/multi-chart.png)
+
+**Drawing tools — trend line with its style toolbar**
+
+![Drawing tools](screenshots/drawing-tools.png)
+
+**News — economic calendar panel (times in IST, display only)**
+
+![News panel](screenshots/news-panel.png)
+
+**Chart trading — the Trade panel (disabled here because DEMO has no MT5)**
+
+![Trade panel](screenshots/trade-panel.png)
 
 ## License
 

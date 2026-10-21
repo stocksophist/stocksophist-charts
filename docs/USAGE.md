@@ -56,7 +56,14 @@ STALE badge when no tick has arrived for 45 seconds.
 - **Bar replay:** the Replay control steps through history bar by bar.
   While replaying, the chart, indicators, and Renko bricks only see bars
   at or before the replay cursor — replay can never peek at future bars.
-  `Escape` cancels replay picking.
+  `Escape` cancels replay picking. Replay is **synced across panes**:
+  pick the start bar on any chart and every pane replays together, each
+  in its own timeframe.
+- **Zoom-sync:** press the **Zoom** button in the top bar, then drag a
+  box on any chart. When you release, **every chart zooms to that time
+  range** — each pane keeps its own timeframe, only the visible time
+  window changes. It works once per press; press Zoom again for another
+  selection, or `Escape` to cancel while it is armed.
 
 ## Watchlist
 

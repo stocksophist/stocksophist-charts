@@ -92,6 +92,12 @@
   }
   /* --------bar-replay ---------- */
   #btn-replay.on { color: var(--accent); border-color: var(--accent); }
+  /* ---------- v3.4.41 zoom-sync ---------- */
+  #btn-zoom.on { color: var(--accent); border-color: var(--accent); }
+  .zoomsel {
+    position: absolute; z-index: 60; pointer-events: none;
+    border: 1px solid var(--accent); background: rgba(88, 166, 255, .15);
+  }
   #replaybar {
     position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
     display: none; align-items: center; gap: 6px; z-index: 1000;
@@ -126,6 +132,14 @@
   body.replay-picking .chartwrap { cursor: crosshair; }
   body.replay-picking .chartwrap::after {
     content: "Click a bar to start replay - Esc cancels";
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    background: var(--bg-panel); border: 1px solid var(--accent); color: var(--text-bright);
+    font-size: 12px; padding: 6px 12px; border-radius: 6px; z-index: 50;
+    pointer-events: none; white-space: nowrap;
+  }
+  body.zoom-armed .chartwrap { cursor: crosshair; }
+  body.zoom-armed .chartwrap::after {
+    content: "Drag a box - every chart zooms to that time range - Esc cancels";
     position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
     background: var(--bg-panel); border: 1px solid var(--accent); color: var(--text-bright);
     font-size: 12px; padding: 6px 12px; border-radius: 6px; z-index: 50;
@@ -1149,6 +1163,7 @@
          Pure display; the existing News button above opens the calendar panel. -->
     <button class="tbtn" id="btn-newsmarks" title="USD news markers on all charts - red = High impact, gold = Medium (display only)">News*</button>
     <button class="tbtn icobtn" id="btn-replay" data-ic="replay" title="Bar replay - step through history bar by bar">Replay</button>
+    <button class="tbtn" id="btn-zoom" title="Zoom-sync - drag a box on any chart; every chart zooms to that time range (each chart keeps its own timeframe)">Zoom</button>
     <button class="tbtn iconly" id="btn-chartset" data-ic="gear" title="Chart / canvas settings"></button>
     <button class="tbtn iconly" id="btn-theme" title="Switch theme"></button>
     <div id="save-state">&#10003; saved</div>

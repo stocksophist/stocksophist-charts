@@ -78,7 +78,7 @@ import alert_defs  # noqa: E402 (alert definitions + trigger log)
 from tickstore import TickVault  # noqa: E402 (local 1-second tick vault)
 import ops  # noqa: E402
 
-VERSION = "3.4.39"
+VERSION = "3.4.41"
 
 # import helper - server runs as `python app/server.py` (script mode,
 # no parent package, so `from . import x` fails) OR as `python -m app.server`.
@@ -592,7 +592,7 @@ def _post_webhook(url, kind, symbol, price, text):
         req = urllib.request.Request(
             url, data=payload,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "StockSophistCharts/3.4.39"},
+                     "User-Agent": "StockSophistCharts/3.4.41"},
             method="POST")
         with urllib.request.urlopen(req, timeout=10) as resp:
             code = getattr(resp, "status", 200)
