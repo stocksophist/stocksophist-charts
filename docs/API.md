@@ -27,7 +27,7 @@ Conventions used below:
 |---|---|---|
 | GET | `/api/status` | Live/demo mode and feed summary. Fields: `version`, `mode` (`LIVE-MT5` / `LIVE-OANDA`), `feed_source` (`mt5` / `oanda`), `feed_label`, `symbol`, `tz`, `utc_offset_h`, `server_time`, `tick_vault`, `alert_engine` (engine stats + `running`), `feed_degraded`, `hist_circuit` (`closed` / `open` / `half-open`). |
 | GET | `/api/health` | Feed health for the STALE badge. Fields: `feed` (`mt5` / `oanda`), `stream_up` (bool — stream connected, or terminal + feed live), `secs_since_tick` (float or null), `secs_since_heartbeat` (float or null — OANDA stream heartbeat age), `quote_stale` (bool — no tick in the last 45 s), `last_bar_time` (newest cached M1 bar, unix s, or null), `hist_sync` (`running` / `idle`). On error returns the same shape with safe defaults. |
-| GET | `/api/version` | Server version. The frontend checks it on load; a mismatch means the Python process is older than the opened page (stale server). Response: `{"version": "3.4.43"}`. |
+| GET | `/api/version` | Server version. The frontend checks it on load; a mismatch means the Python process is older than the opened page (stale server). Response: `{"version": "3.4.44"}`. |
 | GET | `/api/startup_status` | What the server is doing during startup (for the loading UI). Fields: `mt5_live`, `feed_label`, `warming`, `warmed`, `message`, `warmed_bars`, `ticks_today` (vault ticks today, −1 on error), `server_time`, `hist_circuit`, `startup_op`, `tickgap_op`. |
 | GET | `/api/ops` | Live progress of every background operation. Response: `{"ops": [...], "server_time": ...}`. Each op has stage, optional 0–100 percent, a detail line, and an error on failure. |
 | GET | `/api/ops/<op_id>` | Single-op snapshot for focused polling. Returns `{"missing": true, "id": ...}` when no such op exists. |
@@ -138,6 +138,17 @@ Conventions used below:
 | GET | `/api/symbols/search` | Search symbols the feed offers. Query: `q`. Response: `{"symbols": [...]}`. |
 | GET | `/api/news` | News events for one IST calendar day (default: today). Times are IST `HH:MM` plus epoch `ts`. Range mode: with `from`/`to` (unix seconds) returns USD high-impact events (plus Medium when `medium=1`) inside the range as `{"ok", "from", "to", "events", "count", "fetched_at"}`. Display only. |
 | POST | `/api/news/refresh` | Force an immediate calendar re-fetch. |
+
+## Trade Taker
+
+The Trade Taker drawing tool plans and places a risk-sized trade. The
+drawing carries entry, SL and TP prices; direction comes from the
+drawing (SL below entry = BUY, above = SELL); quantity is risk / SL
+distance, rounded DOWN to 0.01 steps, never above the stated risk.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/trade_taker/implement` | Body: `{"symbol", "entry", "sl", "tp", "risk", "bid", "ask", "dry_run"}`. With `dry_run: true` it only computes and returns the plan (`direction`, `order_type`, `qty`, `qty_risk`, `rr`) - nothing is sent, and no MT5 connection is needed (falls back to the XAUUSD rule). With `dry_run: false` it requires a live MT5 connection, recomputes the plan with broker symbol facts, and sends the order + SL + TP through the existing trade path (market order, or buy/sell limit/stop pending). Refuses when even 0.01 lot would exceed the risk. After Implement, quantity is locked on the drawing; later SL/TP drags update the drawing and RR display only. |
 
 ## Notes
 

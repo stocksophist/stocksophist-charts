@@ -22,7 +22,7 @@
   var TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   var ALERT_TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   // premium-style deep history targets (bars) per timeframe
-  var APP_VERSION = "3.4.43";  // must match server VERSION; mismatch banner on load
+  var APP_VERSION = "3.4.44";  // must match server VERSION; mismatch banner on load
   var DEEP_BARS = { "1s": 7200, "15s": 5760,
                     "1m": 20000, "3m": 20000, "5m": 20000,
                     "15m": 20000, "30m": 20000, "1H": 20000, "4H": 20000,
@@ -4138,6 +4138,16 @@
           self.pending = null;
           self.finishToolUse();
         }
+      } else if (tool === "tradetaker") {
+        if (!self.pending || self.pending.type !== tool) {
+          self.pending = { type: tool, p1: { t: d.t, p: d.p }, sx: x, sy: y, dragged: false };
+        } else {
+          var td0 = self.buildTradeTaker(self.pending.p1, { t: d.t, p: d.p });
+          self.addDrawing(td0);
+          self.pending = null;
+          self.finishToolUse();
+          TradeTaker.openRisk(self, self.getDrawing(td0.id));
+        }
       } else if (tool === "trend" || tool === "rect" || tool === "ray" ||
                  tool === "ellipse" || tool === "fib") {
         if (!self.pending || self.pending.type !== tool) {
@@ -4172,7 +4182,7 @@
           if (dr) {
             var dt = dd.t - self.drag.t0, dp = dd.p - self.drag.p0;
             var o = self.drag.orig;
-            if ((dr.type === "long" || dr.type === "short") && self.drag.part &&
+            if ((dr.type === "long" || dr.type === "short" || dr.type === "tradetaker") && self.drag.part &&
                 self.drag.part !== "move") {
               /* the chart app position tool: entry/stop/target lines drag
                  vertically (price only - the box keeps its time anchor) */
@@ -4210,7 +4220,11 @@
         if (dd && e.target && self.wrapEl.contains(e.target)) {
           if (pd.type === "long" || pd.type === "short")
             self.addDrawing(self.buildLongShort(pd.type, pd.p1, { t: dd.t, p: dd.p }));
-          else
+          else if (pd.type === "tradetaker") {
+            var td1 = self.buildTradeTaker(pd.p1, { t: dd.t, p: dd.p });
+            self.addDrawing(td1);
+            TradeTaker.openRisk(self, self.getDrawing(td1.id));
+          } else
             self.addDrawing({ type: pd.type, p1: pd.p1, p2: { t: dd.t, p: dd.p } });
           self.pending = null;
           self.finishToolUse();
@@ -4309,6 +4323,97 @@
     return d.p1.p + (d.p1.p - d.p2.p);
   };
 
+  /* ================================================================ Trade Taker
+     A drawing that plans AND places a trade. p1 = entry, p2 = stop,
+     p3 = target - all three draggable by handles, exactly like the
+     long/short tool. Direction comes from the drawing itself (SL below
+     entry = BUY, above = SELL). Risk ($) is asked once the tool is
+     placed; quantity is risk / SL-distance value, rounded DOWN to 0.01
+     steps, never above the stated risk. Only the Implement button sends
+     anything, through the existing /api/trade_taker/implement route.
+     After Implement the quantity is LOCKED: later SL/TP drags update the
+     drawing and the RR display only, never the quantity, and never the
+     broker order (manage a live order from the trade panel). */
+  /* === TradeTaker pure logic (extracted by tests) === */
+  var TradeTaker = {
+    QTY_STEP: 0.01,
+    NEAR_POINTS: 10,
+    FB_TICK_SIZE: 0.01, FB_TICK_VALUE: 1.0, FB_POINT: 0.01, FB_STOPS: 0,
+    directionOf: function (entry, sl) {
+      if (!isFinite(entry) || !isFinite(sl)) return null;
+      if (sl < entry) return "buy";
+      if (sl > entry) return "sell";
+      return null;
+    },
+    decideOrderType: function (direction, entry, bid, ask, point, stopsLevel) {
+      if (direction !== "buy" && direction !== "sell") return { type: null, reason: "unknown direction" };
+      if (!isFinite(entry)) return { type: null, reason: "bad entry price" };
+      var ref = direction === "buy" ? ask : bid;
+      if (ref === null || ref === undefined || !isFinite(ref)) return { type: null, reason: "no live price" };
+      var pt = (isFinite(point) && point > 0) ? point : this.FB_POINT;
+      var nearTol = Math.max(this.NEAR_POINTS, parseInt(stopsLevel, 10) || 0) * pt;
+      /* epsilon: a 10.00-pt distance must not flip to pending on float dust */
+      if (Math.abs(entry - ref) <= nearTol + 1e-9) return { type: "market", reason: "entry near market" };
+      if (direction === "buy") return entry < ref ?
+        { type: "buy_limit", reason: "entry below market" } : { type: "buy_stop", reason: "entry above market" };
+      return entry > ref ?
+        { type: "sell_limit", reason: "entry above market" } : { type: "sell_stop", reason: "entry below market" };
+    },
+    riskAt001: function (entry, sl, tickSize, tickValue) {
+      return Math.abs(entry - sl) / tickSize * tickValue * this.QTY_STEP;
+    },
+    calcQty: function (risk, entry, sl, tickSize, tickValue) {
+      if (!isFinite(risk) || risk <= 0) return { qty: null, qtyRisk: 0, error: "risk must be above 0" };
+      if (!isFinite(entry) || !isFinite(sl) || entry === sl) return { qty: null, qtyRisk: 0, error: "SL must differ from entry" };
+      if (!isFinite(tickSize) || tickSize <= 0 || !isFinite(tickValue) || tickValue <= 0) return { qty: null, qtyRisk: 0, error: "bad symbol facts" };
+      var at001 = this.riskAt001(entry, sl, tickSize, tickValue);
+      if (!(at001 > 0)) return { qty: null, qtyRisk: 0, error: "bad SL distance" };
+      var units = Math.floor(risk / at001 + 1e-9); /* floor: never above the budget */
+      if (units < 1) return { qty: null, qtyRisk: 0, error: "risk too small for minimum 0.01 lot" };
+      var qty = Math.round(units * this.QTY_STEP * 100) / 100;
+      return { qty: qty, qtyRisk: Math.round(qty * at001 / this.QTY_STEP * 100) / 100, error: "" };
+    },
+    calcRR: function (entry, sl, tp) {
+      if (!isFinite(entry) || !isFinite(sl) || !isFinite(tp)) return null;
+      var risk = Math.abs(entry - sl);
+      if (risk <= 0) return null;
+      return Math.abs(tp - entry) / risk;
+    },
+    plan: function (entry, sl, tp, risk, quote, facts) {
+      var direction = this.directionOf(entry, sl);
+      if (!direction) return { ok: false, message: "SL must differ from entry" };
+      if (!isFinite(risk) || risk <= 0) return { ok: false, message: "risk must be above 0" };
+      if (tp === null || tp === undefined || !isFinite(tp)) return { ok: false, message: "TP is required" };
+      if ((direction === "buy" && tp <= entry) || (direction === "sell" && tp >= entry))
+        return { ok: false, message: "TP must be on the profit side of entry" };
+      facts = facts || {};
+      var ts = facts.tickSize || this.FB_TICK_SIZE, tv = facts.tickValue || this.FB_TICK_VALUE;
+      var q = this.calcQty(risk, entry, sl, ts, tv);
+      if (q.qty === null) return { ok: false, message: q.error };
+      var ot = this.decideOrderType(direction, entry,
+        quote ? quote.bid : null, quote ? quote.ask : null,
+        facts.point || this.FB_POINT, facts.stopsLevel || 0);
+      return { ok: true, direction: direction, orderType: ot.type, orderTypeReason: ot.reason,
+               qty: q.qty, qtyRisk: q.qtyRisk, risk: risk, rr: this.calcRR(entry, sl, tp),
+               valueSource: facts.tickSize ? "broker" : "fallback" };
+    }
+  };
+  /* === end TradeTaker pure logic === */
+
+  /* Two-point gesture like long/short: dragging DOWN from entry puts the
+     stop below (BUY setup, target mirrored above); dragging UP puts the
+     stop above (SELL setup, target mirrored below). All three lines are
+     then independently draggable by handles. */
+  ChartPane.prototype.buildTradeTaker = function (p1, endPt) {
+    var eP = p1.p, xP = endPt.p, stopP, tgtP;
+    if (xP <= eP) { stopP = xP; tgtP = eP + (eP - xP); }
+    else { stopP = xP; tgtP = eP - (eP - xP); }
+    return { type: "tradetaker", p1: p1, p2: { t: endPt.t, p: stopP },
+             p3: { t: endPt.t, p: tgtP },
+             risk: null, qty: null, qtyRisk: null, orderType: null,
+             implemented: false, ticket: null };
+  };
+
   ChartPane.prototype.removeDrawing = function (id) {
     this.state.drawings = this.state.drawings.filter(function (d) { return d.id !== id; });
     if (this.selectedId === id) this.selectedId = null;
@@ -4327,7 +4432,7 @@
      chart-style: line color / width / style (solid-dashed-dotted) /
      line transparency + box fill color / fill transparency. Per tool. */
   var DRAW_TOOLS = ["trend", "ray", "hline", "hray", "vline", "rect",
-                    "ellipse", "fib", "long", "short", "text"];
+                    "ellipse", "fib", "long", "short", "tradetaker", "text"];
 
   ChartPane.prototype.buildFmtBar = function () {
     var self = this, bar = this.fmtBar;
@@ -4436,7 +4541,7 @@
   };
 
   var DRAW_LINE_TOOLS = { trend: 1, ray: 1, hline: 1, hray: 1, vline: 1 };
-  var DRAW_SHAPES = { rect: 1, ellipse: 1, long: 1, short: 1 };
+  var DRAW_SHAPES = { rect: 1, ellipse: 1, long: 1, short: 1, tradetaker: 1 };
   var DRAW_TEXTUAL = { text: 1, rect: 1 };   // objects with a real Text tab
   var DRAW_TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "1H", "4H", "D", "W", "M"];
 
@@ -4590,6 +4695,16 @@
            (d.locked ? "Unlock" : "Lock") + '">' + (d.locked ? DICO.lock : DICO.unlock) + "</button>";
       h += '<button class="ob" data-act="del" title="Delete"' + (d.locked ? " disabled" : "") + ">" +
            DICO.trash + "</button>";
+      if (tool === "tradetaker") {
+        h += '<span class="sep"></span>';
+        if (d.implemented) {
+          h += '<span class="ob" title="Live order ticket">LIVE #' + escHtml(String(d.ticket)) + " (qty locked)</span>";
+        } else {
+          h += '<button class="ob" data-act="tt-risk" title="Set risk amount">Risk $</button>';
+          h += '<button class="ob" data-act="tt-implement" title="Send order + SL + TP"' +
+               ((d.qty === null || d.qty === undefined) ? " disabled" : "") + ">Implement</button>";
+        }
+      }
     }
     bar.innerHTML = h;
     function applyPatch(patch, fontPatch) {
@@ -4616,7 +4731,11 @@
     bar.querySelectorAll("button[data-act]").forEach(function (b) {
       b.addEventListener("click", function () {
         var act = b.dataset.act;
-        if (act === "text") {
+        if (act === "tt-risk") {
+          TradeTaker.openRisk(self, d);
+        } else if (act === "tt-implement") {
+          TradeTaker.implement(self, d);
+        } else if (act === "text") {
           TextDialog.open("Text", "Text:", d.text || "", function (v) {
             if (v === null || d.locked) return;
             d.text = v; self.persist(); self.draw(); self.refreshObjBar();
@@ -5106,7 +5225,7 @@
             if (fy !== null && fy !== undefined && Math.abs(y - fy) < 6 && x >= lx0 - 4 && x <= lx1 + 4) return d;
           }
         }
-      } else if (d.type === "long" || d.type === "short") {
+      } else if (d.type === "long" || d.type === "short" || d.type === "tradetaker") {
         /* chart-style position tool: grabbable entry / stop / target
            lines (part recorded in _hitPart for the drag handler), otherwise
            the whole figure moves*/
@@ -5222,6 +5341,9 @@
           /* live position-tool preview: the real boxes/labels, not a line */
           var pmd = this.toData(this.pending.px, this.pending.py);
           if (pmd) this.drawLongShort(ctx, this.buildLongShort(pt, this.pending.p1, pmd), false);
+        } else if (pt === "tradetaker") {
+          var pmt = this.toData(this.pending.px, this.pending.py);
+          if (pmt) this.drawTradeTaker(ctx, this.buildTradeTaker(this.pending.p1, pmt), false);
         } else if (pt === "trend" || pt === "ray" || pt === "fib") {
           ctx.moveTo(p1.x, p1.y); ctx.lineTo(this.pending.px, this.pending.py);
         } else if (pt === "ellipse") {
@@ -5418,6 +5540,8 @@
       dot(ctx, pa.x, pa.y, col); dot(ctx, pb.x, pb.y, col);
     } else if (d.type === "long" || d.type === "short") {
       this.drawLongShort(ctx, d, sel);
+    } else if (d.type === "tradetaker") {
+      this.drawTradeTaker(ctx, d, sel);
     }
     /* double-click text label attached to any drawing (rect/text draw their
        own text above)*/
@@ -5555,6 +5679,199 @@
     centerPill(entryY + 11, "Risk/reward ratio: " + rr.toFixed(2));
     ctx.globalAlpha = 1; ctx.setLineDash([]);
     dot(ctx, pa.x, pa.y, isLong ? G : R);
+  };
+
+  /* Trade Taker rendering: same boxes/lines as long/short, plus the
+     trade summary. Direction comes from the drawing (SL below entry =
+     BUY, above = SELL). Quantity is shown only once risk is set, and
+     after Implement it is labelled LOCKED - later drags never change
+     it, they only move the lines and refresh RR. */
+  ChartPane.prototype.drawTradeTaker = function (ctx, d, sel) {
+    var st = DrawStyle.of(d);
+    var entryP = d.p1.p, stopP = d.p2.p, tgtP = (d.p3 && isFinite(d.p3.p)) ? d.p3.p : entryP + (entryP - stopP);
+    var dir = TradeTaker.directionOf(entryP, stopP);
+    var G = "#26a69a", R = "#ef5350", B = "#2962ff";
+    var pa = this.px(d.p1.t, entryP), pb = this.px(d.p2.t, stopP);
+    if (!pa || !pb) return;
+    var ptg = this.series.priceToCoordinate(tgtP);
+    if (ptg === null || ptg === undefined) return;
+    var x0 = Math.min(pa.x, pb.x), x1 = Math.max(pa.x, pb.x) + 90;
+    var entryY = pa.y, stopY = pb.y;
+    var fillA = st.fillOpacity === undefined ? 0.12 : st.fillOpacity;
+    var ry0 = Math.min(entryY, ptg), ry1 = Math.max(entryY, ptg);
+    ctx.globalAlpha = fillA; ctx.fillStyle = G;
+    ctx.fillRect(x0, ry0, x1 - x0, Math.max(ry1 - ry0, 2));
+    ctx.globalAlpha = 0.85; ctx.strokeStyle = G; ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, ry0 + 0.5, x1 - x0 - 1, Math.max(ry1 - ry0, 2) - 1);
+    var ky0 = Math.min(entryY, stopY), ky1 = Math.max(entryY, stopY);
+    ctx.globalAlpha = fillA; ctx.fillStyle = R;
+    ctx.fillRect(x0, ky0, x1 - x0, Math.max(ky1 - ky0, 2));
+    ctx.globalAlpha = 0.85; ctx.strokeStyle = R;
+    ctx.strokeRect(x0 + 0.5, ky0 + 0.5, x1 - x0 - 1, Math.max(ky1 - ky0, 2) - 1);
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = B; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, entryY); ctx.lineTo(x1, entryY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = G;
+    ctx.beginPath(); ctx.moveTo(x0, ptg); ctx.lineTo(x1, ptg); ctx.stroke();
+    ctx.strokeStyle = R;
+    ctx.beginPath(); ctx.moveTo(x0, stopY); ctx.lineTo(x1, stopY); ctx.stroke();
+    if (sel) {
+      ctx.setLineDash([4, 3]); ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1;
+      ctx.strokeRect(x0 - 4.5, Math.min(ry0, ky0) - 4.5, x1 - x0 + 9,
+                     Math.max(ry1, ky1) - Math.min(ry0, ky0) + 9);
+      ctx.setLineDash([]);
+    }
+    function pill(cy, text, color) {
+      ctx.font = "11px sans-serif";
+      var w = ctx.measureText(text).width + 16, cx = (x0 + x1) / 2;
+      ctx.fillStyle = "rgba(19,23,34,0.92)";
+      rrect(ctx, cx - w / 2, cy - 9, w, 18, 5); ctx.fill();
+      ctx.fillStyle = color || "#ffffff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(text, cx, cy + 0.5);
+      ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    }
+    function sideLabel(y, text) {
+      ctx.font = "600 11px sans-serif";
+      ctx.fillStyle = "#ffffff"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      ctx.shadowColor = "rgba(0,0,0,0.75)"; ctx.shadowBlur = 3;
+      ctx.fillText(text, x0 + 5, y);
+      ctx.shadowBlur = 0; ctx.textBaseline = "alphabetic";
+    }
+    sideLabel(entryY, "ENTRY " + entryP.toFixed(2));
+    sideLabel(stopY, "SL " + stopP.toFixed(2));
+    sideLabel(ptg, "TP " + tgtP.toFixed(2));
+    var dirTxt = dir === "buy" ? "BUY" : (dir === "sell" ? "SELL" : "NO DIRECTION");
+    pill(entryY - 22, "TRADE TAKER - " + dirTxt, dir === "sell" ? R : G);
+    if (d.implemented) {
+      pill(entryY - 11, "LIVE #" + d.ticket + "  -  QTY LOCKED: " + d.qty, "#ffb300");
+      var rrLive = TradeTaker.calcRR(entryP, stopP, tgtP);
+      pill(entryY + 11, "RR: " + (rrLive === null ? "n/a" : rrLive.toFixed(2)) +
+           "  -  SL/TP moves update this drawing only");
+    } else if (d.qty !== null && d.qty !== undefined && isFinite(d.qty)) {
+      var rr = TradeTaker.calcRR(entryP, stopP, tgtP);
+      pill(entryY - 11, "Risk $" + d.risk + "  -  Qty " + d.qty +
+           "  -  Risked $" + (d.qtyRisk !== null && d.qtyRisk !== undefined ? d.qtyRisk : "?"));
+      pill(entryY + 11, "RR: " + (rr === null ? "n/a" : rr.toFixed(2)) +
+           (d.orderType ? "  -  " + d.orderType.replace("_", " ").toUpperCase() : ""));
+    } else {
+      pill(entryY + 11, "Set risk from the toolbar (Risk button)");
+    }
+    ctx.globalAlpha = 1; ctx.setLineDash([]);
+    dot(ctx, pa.x, pa.y, dir === "sell" ? R : G);
+  };
+
+  /* Trade Taker UI - risk dialog + Implement flow. These touch Modal and
+     fetch, so they live OUTSIDE the pure-logic block above. Nothing here
+     sends an order except the Confirm button inside implement(). */
+  TradeTaker.symbolFacts = function (pane, cb) {
+    var fb = { tickSize: this.FB_TICK_SIZE, tickValue: this.FB_TICK_VALUE,
+               point: this.FB_POINT, stopsLevel: this.FB_STOPS, source: "fallback" };
+    var sym = (pane.state && pane.state.symbol) ||
+              (typeof Trade !== "undefined" && Trade.activeSymbol ? Trade.activeSymbol() : "XAUUSD");
+    if (typeof Trade === "undefined" || !Trade.live) { cb(fb); return; }
+    fetch("/api/trade/symbol_info?symbol=" + encodeURIComponent(sym))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.ok) cb({ tickSize: j.tick_size, tickValue: j.tick_value, point: j.point,
+                            stopsLevel: j.stops_level, source: "broker" });
+        else cb(fb);
+      })
+      .catch(function () { cb(fb); });
+  };
+  TradeTaker.openRisk = function (pane, d) {
+    if (!d) return;
+    if (d.implemented) { toast("Quantity is locked after implement"); return; }
+    var self = this;
+    var cur = (d.risk !== null && d.risk !== undefined) ? d.risk : "";
+    Modal.open("Trade Taker - Risk",
+      "<p>How much are you willing to risk on this trade?</p>" +
+      '<p><input id="tt-risk-in" type="number" min="0" step="0.01" value="' + escHtml(String(cur)) +
+      '" style="width:160px" placeholder="Risk in $"> <span class="note">$</span></p>' +
+      '<p class="note">Quantity is rounded DOWN to 0.01 steps and never exceeds this risk. ' +
+      "Nothing is sent until you press Implement.</p>" +
+      '<p id="tt-risk-err" class="note" style="color:var(--warn)"></p>',
+      '<button class="btn ghost" id="tt-risk-no">Cancel</button>' +
+      '<button class="btn" id="tt-risk-yes">Calculate</button>');
+    $("tt-risk-no").addEventListener("click", Modal.close);
+    $("tt-risk-yes").addEventListener("click", function () {
+      var risk = parseFloat($("tt-risk-in").value);
+      if (!isFinite(risk) || risk <= 0) {
+        $("tt-risk-err").textContent = "Enter a risk amount above 0.";
+        return;
+      }
+      var entry = d.p1.p, sl = d.p2.p;
+      var tp = (d.p3 && isFinite(d.p3.p)) ? d.p3.p : pane.lsTarget(d);
+      self.symbolFacts(pane, function (facts) {
+        var plan = self.plan(entry, sl, tp, risk, pane.lastQuote || null, facts);
+        if (!plan.ok) { $("tt-risk-err").textContent = plan.message; return; }
+        d.risk = risk; d.qty = plan.qty; d.qtyRisk = plan.qtyRisk;
+        d.orderType = plan.orderType; d.rr = plan.rr; d.valueSource = plan.valueSource;
+        Modal.close();
+        pane.persist(); pane.draw(); pane.refreshObjBar();
+        toast("Trade Taker: qty " + plan.qty +
+              (plan.orderType ? " (" + plan.orderType.replace("_", " ") + ")" : " (order type decided at Implement)") +
+              (plan.valueSource === "fallback" ? " - broker values unavailable, XAUUSD fallback used" : ""));
+      });
+    });
+  };
+  TradeTaker.implement = function (pane, d) {
+    if (!d || d.implemented) { toast(d && d.implemented ? "Already live" : "No trade selected"); return; }
+    if (typeof Replay !== "undefined" && Replay.active) { toast("Cannot place orders during replay"); return; }
+    if (typeof Trade !== "undefined" && !Trade.guard()) return;
+    if (d.qty === null || d.qty === undefined) {
+      toast("Set risk first (Risk button)");
+      this.openRisk(pane, d);
+      return;
+    }
+    if (d._ttBusy) return;
+    d._ttBusy = true;
+    var self = this;
+    var sym = (pane.state && pane.state.symbol) ||
+              (typeof Trade !== "undefined" && Trade.activeSymbol ? Trade.activeSymbol() : "XAUUSD");
+    var q = pane.lastQuote || {};
+    var tp = (d.p3 && isFinite(d.p3.p)) ? d.p3.p : pane.lsTarget(d);
+    var payload = { symbol: sym, entry: d.p1.p, sl: d.p2.p, tp: tp, risk: d.risk,
+                    bid: q.bid, ask: q.ask, dry_run: true };
+    function post(body) {
+      return fetch("/api/trade_taker/implement", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body) }).then(function (r) { return r.json(); });
+    }
+    post(payload).then(function (prev) {
+      d._ttBusy = false;
+      if (!prev.ok) { toast("Cannot implement: " + prev.message, true); return; }
+      var dirTxt = prev.direction === "buy" ? "BUY" : "SELL";
+      var otype = (prev.order_type || "").replace("_", " ").toUpperCase();
+      Modal.open("Confirm Trade Taker",
+        "<p><b>" + dirTxt + " " + prev.qty + " " + escHtml(sym) + "</b> - " + escHtml(otype) + "<br>" +
+        "Entry " + d.p1.p.toFixed(2) + " - SL " + d.p2.p.toFixed(2) + " - TP " + tp.toFixed(2) + "<br>" +
+        "Risk $" + prev.risk + " (position risks $" + prev.qty_risk + ") - RR " +
+        (prev.rr === null ? "n/a" : prev.rr.toFixed(2)) + "<br>" +
+        "This sends a real order to MT5.</p>",
+        '<button class="btn ghost" id="tt-cf-no">Cancel</button>' +
+        '<button class="btn" id="tt-cf-yes">Send order</button>');
+      $("tt-cf-no").addEventListener("click", Modal.close);
+      $("tt-cf-yes").addEventListener("click", function () {
+        Modal.close();
+        d._ttBusy = true;
+        var live = Object.assign({}, payload, { dry_run: false });
+        post(live).then(function (res) {
+          d._ttBusy = false;
+          if (!res.ok) { toast("Order failed: " + res.message, true); return; }
+          d.implemented = true; d.qty = res.qty;
+          d.ticket = res.ticket || res.order || null;
+          d.liveOrderType = res.order_type;
+          pane.persist(); pane.draw(); pane.refreshObjBar();
+          toast(res.message || "Order placed");
+          if (typeof playAlertSound === "function") playAlertSound();
+        }).catch(function (e) {
+          d._ttBusy = false; toast("Order failed: " + e.message, true);
+        });
+      });
+    }).catch(function (e) {
+      d._ttBusy = false; toast("Cannot implement: " + e.message, true);
+    });
   };
 
   /* ----------------------------------------------------- indicator engine */

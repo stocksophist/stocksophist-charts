@@ -74,11 +74,12 @@ class _RenkoLoading(RuntimeError):
     """
 import indicators as indlib  # noqa: E402 (library: built-ins + user scripts)
 from mt5trade import register_trade_routes  # noqa: E402 (direct chart trading)
+from trade_taker import register_tradetaker_routes  # noqa: E402 (Trade Taker tool)
 import alert_defs  # noqa: E402 (alert definitions + trigger log)
 from tickstore import TickVault  # noqa: E402 (local 1-second tick vault)
 import ops  # noqa: E402
 
-VERSION = "3.4.43"
+VERSION = "3.4.44"
 
 # import helper - server runs as `python app/server.py` (script mode,
 # no parent package, so `from . import x` fails) OR as `python -m app.server`.
@@ -592,7 +593,7 @@ def _post_webhook(url, kind, symbol, price, text):
         req = urllib.request.Request(
             url, data=payload,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "StockSophistCharts/3.4.43"},
+                     "User-Agent": "StockSophistCharts/3.4.44"},
             method="POST")
         with urllib.request.urlopen(req, timeout=10) as resp:
             code = getattr(resp, "status", 200)
@@ -837,6 +838,7 @@ if HAS_MT5 and os.environ.get("STOCKSOPHIST_NO_AUTO_MT5") != "1":
 # Direct chart trading (BUY/SELL at market, pendings, drag SL/TP, close).
 # Every route refuses when MT5 is not live - DEMO can never send an order.
 register_trade_routes(app, conn)
+register_tradetaker_routes(app, conn)
 
 # Deep history targets (bars per timeframe).
 # The first load backfills up to this many bars; later polls only refresh
