@@ -70,7 +70,7 @@ the Telegram API when you enable Telegram alerts).
 ## Quick start
 
 ```sh
-git clone <repo-url>
+git clone https://github.com/stocksophist/stocksophist-charts.git
 cd stocksophist-charts
 pip install -r requirements.txt
 ```
