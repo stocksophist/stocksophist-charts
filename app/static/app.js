@@ -22,7 +22,7 @@
   var TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   var ALERT_TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   // premium-style deep history targets (bars) per timeframe
-  var APP_VERSION = "3.4.41";  // must match server VERSION; mismatch banner on load
+  var APP_VERSION = "3.4.43";  // must match server VERSION; mismatch banner on load
   var DEEP_BARS = { "1s": 7200, "15s": 5760,
                     "1m": 20000, "3m": 20000, "5m": 20000,
                     "15m": 20000, "30m": 20000, "1H": 20000, "4H": 20000,
@@ -1512,6 +1512,17 @@
      Live polling pauses while replay owns the series (the quote strip stays
      live); the alert engine is untouched, so replay never fires Telegram
      alerts. Exiting restores the full live chart.*/
+  /* v3.4.43: replay viewport centering. The latest replayed bar is the
+     anchor: given its logical index and a half-width, return the visible
+     range that puts it dead-center. The left edge clamps at 0 (early
+     replay has no bars to the left), in which case the range is shorter
+     and the bar sits as close to center as the data allows. Pure
+     function, unit-tested in tests/test_v343_regressions.js. */
+  function replayCenterRange(last, halfW) {
+    var from = Math.max(0, last - halfW);
+    return { from: from, to: last + halfW };
+  }
+
   var Replay = {
     active: false, picking: false,
     cursorT: 0, anchorId: null, full: {},
@@ -1713,14 +1724,14 @@
       if (vis.length) p.cur = Object.assign({}, vis[vis.length - 1]);
       p.applyMarkers();
       p.draw();
-      /* Autoplay keeps the cursor in view (last ~170 bars); a manual step
-         leaves the viewport alone so you can inspect.*/
+      /* Autoplay keeps the cursor in view; a manual step leaves the
+         viewport alone so you can inspect. v3.4.43: the latest replayed
+         candle is CENTERED (same 178-bar window as before, was: last bar
+         pinned 8 bars from the right edge). */
       if ((this.playing || fitView) && vis.length > 1) {
         try {
-          p.chart.timeScale().setVisibleLogicalRange({
-            from: Math.max(0, vis.length - 170),
-            to: vis.length - 1 + 8
-          });
+          p.chart.timeScale().setVisibleLogicalRange(
+            replayCenterRange(vis.length - 1, 89));
         } catch (e) {}
       }
     },
@@ -1748,12 +1759,11 @@
           p.cur = Object.assign({}, res.bricks[res.bricks.length - 1]);
         p.applyMarkers();
         p.draw();
+        /* v3.4.43: center the latest brick, same as the candle path. */
         if ((self.playing || fitView) && res.bricks.length > 1) {
           try {
-            p.chart.timeScale().setVisibleLogicalRange({
-              from: Math.max(0, res.bricks.length - 170),
-              to: res.bricks.length - 1 + 8
-            });
+            p.chart.timeScale().setVisibleLogicalRange(
+              replayCenterRange(res.bricks.length - 1, 89));
           } catch (e) {}
         }
       }).catch(function () { /* keep old bricks on transient error*/ });
@@ -3922,11 +3932,86 @@
   };
 
   /* ================================================================ drawings */
+  /* v3.4.43: time -> x mapping that survives timeframe switches.
+     lightweight-charts' timeToCoordinate() returns null unless the time
+     EXACTLY equals a bar time of the CURRENT series (its timeToIndex runs
+     with findNearest=false: times before the first bar, after the last bar,
+     or between bars all map to null). A drawing plotted on a higher
+     timeframe therefore vanished on a lower one whenever its bar times
+     were not on the new grid (3m vs 5m, 30m vs 1H, seconds TFs, typed-in
+     datetimes, or times outside the newly loaded window) - drawOne()
+     skips any drawing with a null endpoint. timeX() keeps the exact
+     library mapping as the fast path and falls back to interpolation
+     between the pane's own neighbouring bars (index-space: adjacent bars
+     are 1 index apart, so linear pixel interpolation between them IS the
+     scale's mapping), extrapolating with edge spacing outside the loaded
+     range. A time inside the visible viewport then always maps to a
+     coordinate; times far outside map far off-canvas and are clipped by
+     the canvas itself. Horizontal levels consequently persist while
+     scrolling, like charting apps - previously they vanished with the
+     time going out of range. */
+  ChartPane.prototype.timeX = function (t) {
+    var slot = this.renkoSlot(t);
+    var cx = this._pxCacheX;
+    if (cx && Object.prototype.hasOwnProperty.call(cx, slot)) return cx[slot];
+    var x = this.chart.timeScale().timeToCoordinate(slot);
+    if (x === null || x === undefined) x = this._interpX(slot);
+    if (cx) cx[slot] = x;
+    return x;
+  };
+  ChartPane.prototype._interpX = function (slot) {
+    var sd = this.seriesData;
+    if (!sd || sd.length < 2) return null;
+    var tsa = this.chart.timeScale();
+    var lo = 0, hi = sd.length - 1, mid, ans = sd.length;
+    while (lo <= hi) {
+      mid = (lo + hi) >> 1;
+      if (sd[mid].time >= slot) { ans = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    var i0, i1;
+    if (ans === 0) { i0 = 0; i1 = 1; }
+    else if (ans >= sd.length) { i0 = sd.length - 2; i1 = sd.length - 1; }
+    else { i0 = ans - 1; i1 = ans; }
+    var t0 = sd[i0].time, t1 = sd[i1].time;
+    if (!(t1 > t0)) return null;
+    var x0 = tsa.timeToCoordinate(t0), x1 = tsa.timeToCoordinate(t1);
+    if (x0 === null || x0 === undefined || x1 === null || x1 === undefined) return null;
+    return x0 + (slot - t0) * (x1 - x0) / (t1 - t0);
+  };
+  /* v3.4.43: per-frame price memo. Within one synchronous draw() the
+     price scale cannot change, so repeated priceToCoordinate calls for
+     the same price (shared segment endpoints, labels on one bar) collapse
+     to one lookup. Outside draw() the cache is inactive and lookups run
+     direct, so hit-testing and drags never read a stale frame. */
+  ChartPane.prototype.priceY = function (p) {
+    var cy = this._pxCacheY;
+    if (cy && Object.prototype.hasOwnProperty.call(cy, p)) return cy[p];
+    var y = this.series.priceToCoordinate(p);
+    if (cy) cy[p] = y;
+    return y;
+  };
+  /* v3.4.43: label-width memo. measureText is per-frame work that only
+     depends on (font, string); cache it across frames, bounded so exotic
+     label variety cannot grow it without limit. */
+  ChartPane.prototype.measureCached = function (str, font) {
+    var c = this._textWCache;
+    if (!c) c = this._textWCache = {};
+    var k = font + "\n" + str;
+    var w = c[k];
+    if (w === undefined) {
+      if (Object.keys(c).length > 8000) { c = this._textWCache = {}; }
+      this.ctx.font = font;
+      w = this.ctx.measureText(str).width;
+      c[k] = w;
+    }
+    return w;
+  };
   ChartPane.prototype.px = function (t, p) {
     /* drawings store real times from older versions or slot times;
        map to slot space on Renko so both render. */
-    var x = this.chart.timeScale().timeToCoordinate(this.renkoSlot(t));
-    var y = this.series.priceToCoordinate(p);
+    var x = this.timeX(t);
+    var y = this.priceY(p);
     return (x === null || x === undefined || y === null || y === undefined) ? null : { x: x, y: y };
   };
 
@@ -5060,6 +5145,12 @@
     var w = this.wrapEl.clientWidth, h = this.wrapEl.clientHeight;
     if (!w || !h) return;
     ctx.clearRect(0, 0, w, h);
+    /* v3.4.43: per-frame coordinate memo, live only for this paint.
+       Zoom/pan gestures repaint every frame; without this, every shared
+       endpoint (segment joints, labels on one bar) re-ran the library's
+       time/price lookups. Cleared at the end of this function so no later
+       frame, hit-test or drag can ever read a stale scale. */
+    this._pxCacheX = {}; this._pxCacheY = {};
     /* Viewport culling: skip overlay elements fully outside the visible time
        range. Dense indicators (e.g. 70k+ one-bar ORB segments) would otherwise
        stroke every segment on every pan frame and jank. Nothing visible is
@@ -5142,6 +5233,8 @@
         ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
       }
     }
+    /* v3.4.43: end of frame - drop the coordinate memo. */
+    this._pxCacheX = null; this._pxCacheY = null;
   };
 
   /* requestAnimationFrame-throttled redraw: mousemove drags coalesce to one
@@ -5962,14 +6055,15 @@
       var bar = self.barAt(t);
       if (!bar) return;
       var sell = String(L.side || "").toLowerCase() !== "buy";
-      var x = self.chart.timeScale().timeToCoordinate(t);
+      var x = self.timeX(t);
       if (x === null || x === undefined) return;
       var anchorP = sell ? bar.high : bar.low;
-      var ay = self.series.priceToCoordinate(anchorP);
+      var ay = self.priceY(anchorP);
       if (ay === null || ay === undefined) return;
       var maxW = 0, li;
       for (li = 0; li < L.lines.length; li++) {
-        maxW = Math.max(maxW, ctx.measureText(L.lines[li]).width);
+        maxW = Math.max(maxW, self.measureCached(L.lines[li],
+          "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"));
       }
       var bw = Math.ceil(maxW) + padX * 2;
       var bh = L.lines.length * lh + padY * 2;
@@ -6167,13 +6261,13 @@
 
   ChartPane.prototype.drawIndLine = function (L) {
     /* indicator lines carry real times; map to slot times on Renko. */
-    var x0 = this.chart.timeScale().timeToCoordinate(this.renkoSlot(L.t0));
+    var x0 = this.timeX(L.t0);
     if (x0 === null || x0 === undefined) return;
     var w = this.wrapEl.clientWidth;
     var x1;
     if (L.t1) {
       /* fixed historical segment: draw exactly t0 -> t1 */
-      x1 = this.chart.timeScale().timeToCoordinate(this.renkoSlot(L.t1));
+      x1 = this.timeX(L.t1);
       if (x1 === null || x1 === undefined) x1 = w;
     } else {
       /* Open-ended level line (support/resistance ray): extend a short way
@@ -6182,13 +6276,13 @@
          out. Now ends 80px past the last bar (chart-like), capped at
          the viewport edge.*/
       var lastT = (this.cur && this.cur.time) ? this.cur.time : null;
-      var lastX = lastT ? this.chart.timeScale().timeToCoordinate(lastT) : null;
+      var lastX = lastT ? this.timeX(lastT) : null;
       x1 = (lastX !== null && lastX !== undefined) ? lastX + 80 : w - 2;
     }
     x1 = Math.min(x1, w - 2);
     var p0 = (L.p0 !== undefined && L.p0 !== null) ? L.p0 : L.price;
     var p1 = (L.p1 !== undefined && L.p1 !== null) ? L.p1 : p0;
-    var y0 = this.series.priceToCoordinate(p0), y1 = this.series.priceToCoordinate(p1);
+    var y0 = this.priceY(p0), y1 = this.priceY(p1);
     if (y0 === null || y0 === undefined || y1 === null || y1 === undefined) return;
     var ctx = this.ctx;
     ctx.strokeStyle = L.color; ctx.lineWidth = L.width || 1;
@@ -6196,8 +6290,8 @@
     ctx.beginPath(); ctx.moveTo(Math.max(x0, 0), y0); ctx.lineTo(x1, y1); ctx.stroke();
     ctx.setLineDash([]);
     if (L.label) {
-      ctx.font = labelPx(L.label_size) + "px sans-serif";
-      var tw = ctx.measureText(L.label).width;
+      var lfont = labelPx(L.label_size) + "px sans-serif";
+      var tw = this.measureCached(L.label, lfont);
       var bx = Math.max(x1 - tw - 12, 2), by = Math.min(y0, y1) - 18;
       ctx.fillStyle = "rgba(19,23,34,0.88)";
       ctx.fillRect(bx, by, tw + 8, 15);
@@ -6223,7 +6317,7 @@
       var ev = evs[i];
       var t = (this.state.mode === "renko") ? this.renkoSlot(ev.ts) : ev.ts;
       if (t < vt0 || t > vt1) continue;
-      var x = tsa.timeToCoordinate(t);
+      var x = self.timeX(t);
       if (x === null || x === undefined) continue;
       var col = NewsMarks.COLORS[ev.impact] || "#ff9800";
       ctx.strokeStyle = col; ctx.lineWidth = 1;
@@ -6295,8 +6389,8 @@
     if (ts.length < 2) return;
     var ctx = this.ctx, self = this;
     function pt(t, v) {
-      var x = self.chart.timeScale().timeToCoordinate(self.renkoSlot(t));
-      var y = self.series.priceToCoordinate(v);
+      var x = self.timeX(t);
+      var y = self.priceY(v);
       if (x === null || x === undefined || y === null || y === undefined) return null;
       return [x, y];
     }
@@ -6335,10 +6429,10 @@
 
   ChartPane.prototype.drawIndBox = function (B) {
     /* indicator boxes carry real times; map to slot times on Renko. */
-    var x0 = this.chart.timeScale().timeToCoordinate(this.renkoSlot(B.t0));
-    var x1 = this.chart.timeScale().timeToCoordinate(this.renkoSlot(B.t1));
+    var x0 = this.timeX(B.t0);
+    var x1 = this.timeX(B.t1);
     if (x0 === null || x0 === undefined || x1 === null || x1 === undefined) return;
-    var y0 = this.series.priceToCoordinate(B.p0), y1 = this.series.priceToCoordinate(B.p1);
+    var y0 = this.priceY(B.p0), y1 = this.priceY(B.p1);
     if (y0 === null || y0 === undefined || y1 === null || y1 === undefined) return;
     var ctx = this.ctx;
     var rx = Math.min(x0, x1), rw = Math.abs(x1 - x0);
