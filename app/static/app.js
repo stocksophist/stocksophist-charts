@@ -22,7 +22,7 @@
   var TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   var ALERT_TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   // premium-style deep history targets (bars) per timeframe
-  var APP_VERSION = "3.4.44";  // must match server VERSION; mismatch banner on load
+  var APP_VERSION = "3.4.46";  // must match server VERSION; mismatch banner on load
   var DEEP_BARS = { "1s": 7200, "15s": 5760,
                     "1m": 20000, "3m": 20000, "5m": 20000,
                     "15m": 20000, "30m": 20000, "1H": 20000, "4H": 20000,
@@ -2485,6 +2485,112 @@
 
   function uid() { return "d" + Math.random().toString(36).slice(2, 10); }
 
+  /* === DrawSync pure logic (extracted by tests) === */
+  /* Drawing sync (TradingView "Sync in layout" scope): panes showing the
+     SAME symbol share drawings. A drawing created while sync is ON gets a
+     syncId (its creator's local id) + syncSymbol; an identical copy lives
+     in each same-symbol pane's own drawings array, so every existing
+     render / hit-test / drag path keeps working unchanged. Copies are
+     matched only by syncId; a synced drawing is visible only when the
+     pane's symbol equals its syncSymbol, so a symbol change hides that
+     symbol's drawings and returning restores them. Propagation touches
+     peer state directly (never via addDrawing / removeDrawing), so a
+     propagated change cannot re-trigger itself. This block is DOM-free:
+     callers refresh (persist/draw) the panes it returns. */
+  var DrawSync = {
+    enabled: true,
+    isSynced: function (d) { return !!(d && d.syncId); },
+    isVisible: function (d, symbol) {
+      return !this.isSynced(d) || d.syncSymbol === symbol;
+    },
+    clone: function (d) { return JSON.parse(JSON.stringify(d)); },
+    find: function (pane, syncId) {
+      var ds = pane.state.drawings;
+      for (var i = 0; i < ds.length; i++)
+        if (ds[i].syncId === syncId) return ds[i];
+      return null;
+    },
+    has: function (pane, syncId) { return !!this.find(pane, syncId); },
+    dedupe: function (drawings) {
+      /* save + reload must never double a synced drawing: keep the first
+         copy of each syncId, keep every unsynced drawing as-is. */
+      var seen = {}, out = [];
+      for (var i = 0; i < drawings.length; i++) {
+        var d = drawings[i];
+        if (d && d.syncId) {
+          if (seen[d.syncId]) continue;
+          seen[d.syncId] = true;
+        }
+        out.push(d);
+      }
+      return out;
+    },
+    onCreate: function (panes, src, d) {
+      /* returns panes that gained a copy */
+      var touched = [];
+      if (!this.enabled || !this.isSynced(d)) return touched;
+      var self = this;
+      panes.forEach(function (p) {
+        if (p === src || !p.state) return;
+        if (p.state.symbol !== d.syncSymbol) return; /* different symbol: never touched */
+        if (self.has(p, d.syncId)) return;           /* already there: no double */
+        p.state.drawings.push(self.clone(d));
+        touched.push(p);
+      });
+      return touched;
+    },
+    onEdit: function (panes, src, d) {
+      /* copies the source's current fields into every peer copy, in place
+         (peer object identity + local id preserved, so peer selection and
+         drag state survive). Returns touched panes. */
+      var touched = [];
+      if (!this.enabled || !this.isSynced(d)) return touched;
+      var self = this;
+      panes.forEach(function (p) {
+        if (p === src || !p.state) return;
+        var c = self.find(p, d.syncId);
+        if (!c) return;
+        Object.keys(d).forEach(function (k) {
+          if (k === "id" || k === "syncId" || k === "syncSymbol" || k === "_ttBusy") return;
+          c[k] = (d[k] === undefined) ? undefined : JSON.parse(JSON.stringify(d[k]));
+        });
+        touched.push(p);
+      });
+      return touched;
+    },
+    onDelete: function (panes, src, syncId) {
+      /* removes the synced drawing from EVERY pane: a hidden copy on a
+         different-symbol pane must go too, or it would resurrect on return */
+      var touched = [];
+      if (!this.enabled || !syncId) return touched;
+      panes.forEach(function (p) {
+        if (p === src || !p.state) return;
+        var before = p.state.drawings.length;
+        p.state.drawings = p.state.drawings.filter(function (x) { return x.syncId !== syncId; });
+        if (p.state.drawings.length !== before) touched.push(p);
+      });
+      return touched;
+    },
+    onSymbolChange: function (panes, pane, symbol) {
+      /* returning to a symbol pulls any synced drawings created on other
+         panes while this pane was away (from open panes only) */
+      var touched = [];
+      if (!this.enabled || !pane.state) return touched;
+      var self = this;
+      panes.forEach(function (p) {
+        if (p === pane || !p.state) return;
+        p.state.drawings.forEach(function (d) {
+          if (d.syncSymbol === symbol && !self.has(pane, d.syncId)) {
+            pane.state.drawings.push(self.clone(d));
+            if (touched.indexOf(pane) < 0) touched.push(pane);
+          }
+        });
+      });
+      return touched;
+    }
+  };
+  /* === end DrawSync pure logic === */
+
   /* script-style colors are #RRGGBBAA. The native palette picker only takes
      #RRGGBB, so color fields render as palette swatch + opacity slider.
      Chart settings may also hold CSS rgb()/rgba() strings - parse those too. */
@@ -2567,6 +2673,8 @@
       box: (saved && saved.box) || 2.5,
       drawings: (saved && saved.drawings) || []
     };
+    /* drawing sync: a reload must never double a synced drawing */
+    this.state.drawings = DrawSync.dedupe(this.state.drawings);
     window.stocksophistTF = this.state.tf;  // initial chart TF for diagnostics
     this.cur = null;        // candle currently being tick-updated
     this.bricks = [];       // renko bricks
@@ -2759,7 +2867,21 @@
         { label: "Price alerts...", fn: function () { Alerts.open(); } },
         { label: "Chart settings...", fn: function () { ChartSet.open(); } },
         { sep: true },
-        { label: "Remove all drawings", fn: function () { self.state.drawings = self.state.drawings.filter(function (x) { return x.locked; }); self.selectedId = null; self.persist(); self.draw(); self.refreshFmtBar(); } }
+        { label: "Remove all drawings", fn: function () {
+          /* synced drawings hidden by a symbol change stay untouched;
+             visible synced drawings are removed everywhere, locked kept */
+          var panes = (typeof Layout !== "undefined" && Layout.panes) || [];
+          var removed = self.state.drawings.filter(function (x) {
+            return !x.locked && DrawSync.isVisible(x, self.state.symbol);
+          });
+          self.state.drawings = self.state.drawings.filter(function (x) {
+            return x.locked || !DrawSync.isVisible(x, self.state.symbol);
+          });
+          self.selectedId = null; self.persist(); self.draw(); self.refreshFmtBar();
+          removed.forEach(function (d) {
+            if (d.syncId) self.refreshPeers(DrawSync.onDelete(panes, self, d.syncId));
+          });
+        } }
       ]);
       self.draw();
     });
@@ -2783,6 +2905,7 @@
       self.state.symbol = self.symInput.value.trim() || "XAUUSD";
       self._resolveNoted = null;  // user picked a new symbol; allow fresh notice
       self.load(true); self.persist();
+      self.afterSymbolChange();
     });
     this.tfMenuBtn.addEventListener("click", function (e) {
       e.stopPropagation();
@@ -2958,6 +3081,7 @@
     this.state.symbol = sym;
     this._resolveNoted = null;
     this.load(true); this.persist();
+    this.afterSymbolChange();
   };
 
   /* When the server substitutes the broker's real symbol for a symbol the
@@ -2970,6 +3094,7 @@
     this.state.symbol = res.symbol;
     this.symInput.value = res.symbol;
     this.persist();
+    this.afterSymbolChange();
     toast(res.resolve_note || ("Showing " + res.symbol));
   };
 
@@ -4210,7 +4335,13 @@
       }
     });
     window.addEventListener("mouseup", function (e) {
-      if (self.drag) { self.drag = null; self.persist(); }
+      if (self.drag) {
+        var dragId = self.drag.id; self.drag = null; self.persist();
+        /* drawing sync: a finished drag updates every synced copy */
+        var dragged = self.getDrawing(dragId);
+        if (dragged && dragged.syncId) self.refreshPeers(DrawSync.onEdit(
+          (typeof Layout !== "undefined" && Layout.panes) || [], self, dragged));
+      }
       /* chart-style click-drag: releasing after a drag completes a
          two-point drawing (a plain click keeps the two-click workflow) */
       if (self.pending && self.pending.dragged && !self.drag) {
@@ -4258,6 +4389,8 @@
         hit.text = txt;
         self.selectedId = hit.id;
         self.persist(); self.draw(); self.refreshObjBar();
+        if (hit.syncId) self.refreshPeers(DrawSync.onEdit(
+          (typeof Layout !== "undefined" && Layout.panes) || [], self, hit));
       });
     });
     /* clicks anywhere outside the pane (topbar, other panes) commit an open
@@ -4286,8 +4419,31 @@
     btn.title = "Add alert at " + btn._price;
   };
 
+  /* drawing sync: refresh every pane DrawSync touched (persist + repaint
+     + object bar, so a peer with the drawing selected shows fresh state) */
+  ChartPane.prototype.refreshPeers = function (touched) {
+    (touched || []).forEach(function (p) {
+      try { p.persist(); p.draw(); p.refreshFmtBar(); p.refreshObjBar(); } catch (e) {}
+    });
+  };
+
+  /* drawing sync: after any symbol change, hide the old symbol's synced
+     drawings (visibility filter), restore this symbol's, and pull any
+     synced drawings created on other panes while this pane was away */
+  ChartPane.prototype.afterSymbolChange = function () {
+    var panes = (typeof Layout !== "undefined" && Layout.panes) || [];
+    var touched = DrawSync.onSymbolChange(panes, this, this.state.symbol);
+    var sel = this.selectedId ? this.getDrawing(this.selectedId) : null;
+    if (sel && !DrawSync.isVisible(sel, this.state.symbol)) this.selectedId = null;
+    if (touched.length) this.persist();
+    this.draw(); this.refreshFmtBar();
+  };
+
   ChartPane.prototype.addDrawing = function (d) {
     d.id = uid();
+    /* drawing sync: a drawing created while sync is ON joins the shared
+       set for this symbol; peers get identical copies below */
+    if (DrawSync.enabled) { d.syncId = d.id; d.syncSymbol = this.state.symbol; }
     /* an explicitly provided style (e.g. the inline text editor) wins;
        otherwise the tool's remembered default applies */
     d.style = Object.assign(DrawStyle.get(d.type), d.style || {});
@@ -4296,6 +4452,8 @@
     this.persist();
     this.draw();
     this.refreshFmtBar();
+    this.refreshPeers(DrawSync.onCreate(
+      (typeof Layout !== "undefined" && Layout.panes) || [], this, d));
   };
 
   /* chart-style long/short position: p1 = entry, p2 = stop,
@@ -4415,11 +4573,15 @@
   };
 
   ChartPane.prototype.removeDrawing = function (id) {
+    var doomed = this.getDrawing(id);
     this.state.drawings = this.state.drawings.filter(function (d) { return d.id !== id; });
     if (this.selectedId === id) this.selectedId = null;
     this.persist();
     this.draw();
     this.refreshFmtBar();
+    if (doomed && doomed.syncId)
+      this.refreshPeers(DrawSync.onDelete(
+        (typeof Layout !== "undefined" && Layout.panes) || [], this, doomed.syncId));
   };
 
   ChartPane.prototype.getDrawing = function (id) {
@@ -4713,6 +4875,8 @@
         d.style = Object.assign(DrawStyle.of(d), patch);
         if (fontPatch) for (var k in fontPatch) d[k] = fontPatch[k];
         self.persist(); self.draw(); self.refreshObjBar();
+        if (d.syncId) self.refreshPeers(DrawSync.onEdit(
+          (typeof Layout !== "undefined" && Layout.panes) || [], self, d));
       } else {
         DrawStyle.set(tool, Object.assign({}, patch, fontPatch));
         self.draw();
@@ -4739,11 +4903,15 @@
           TextDialog.open("Text", "Text:", d.text || "", function (v) {
             if (v === null || d.locked) return;
             d.text = v; self.persist(); self.draw(); self.refreshObjBar();
+            if (d.syncId) self.refreshPeers(DrawSync.onEdit(
+              (typeof Layout !== "undefined" && Layout.panes) || [], self, d));
           });
         } else if (act === "settings") {
           DrawSettings.open(self, d);
         } else if (act === "lock") {
           d.locked = !d.locked; self.persist(); self.draw(); self.refreshObjBar();
+          if (d.syncId) self.refreshPeers(DrawSync.onEdit(
+            (typeof Layout !== "undefined" && Layout.panes) || [], self, d));
         } else if (act === "del") {
           if (!d.locked) { self.removeDrawing(d.id); }
         }
@@ -4863,6 +5031,8 @@
           style: Object.assign(DrawStyle.get("text"), { color: s.color }) });
       }
       this.persist(); this.draw();
+      if (te.d && te.d.syncId && !te.d.locked) this.refreshPeers(DrawSync.onEdit(
+        (typeof Layout !== "undefined" && Layout.panes) || [], this, te.d));
     }
     this.finishToolUse();
     this.refreshFmtBar();
@@ -5040,6 +5210,8 @@
         if (d.locked) { revert(); close(); return; }
         DrawSettings.applyTab(pane, d, cur, body);
         pane.persist(); pane.draw(); pane.refreshFmtBar();
+        if (d.syncId) pane.refreshPeers(DrawSync.onEdit(
+          (typeof Layout !== "undefined" && Layout.panes) || [], pane, d));
         close();
       });
     },
@@ -5164,6 +5336,8 @@
       var d = ds[i], a, b, pa, pb;
       /* hidden on this timeframe => not selectable either */
       if (d.showTf && d.showTf.length && d.showTf.indexOf(tf) < 0) continue;
+      /* drawing sync: another symbol's synced drawings are not selectable */
+      if (!DrawSync.isVisible(d, this.state.symbol)) continue;
       if (d.type === "hline") {
         pa = this.px(d.p1.t, d.p1.p);
         if (pa && Math.abs(y - pa.y) < 6) return d;
@@ -5325,6 +5499,7 @@
     /* visibility tab: a drawing can be hidden on chosen timeframes */
     this.state.drawings.forEach(function (d) {
       if (d.showTf && d.showTf.length && d.showTf.indexOf(self.state.tf) < 0) return;
+      if (!DrawSync.isVisible(d, self.state.symbol)) return;
       self.drawOne(d, d.id === self.selectedId);
     });
     /* keep the floating object toolbar glued near its drawing while panning */
@@ -5809,6 +5984,9 @@
         d.orderType = plan.orderType; d.rr = plan.rr; d.valueSource = plan.valueSource;
         Modal.close();
         pane.persist(); pane.draw(); pane.refreshObjBar();
+        /* drawing sync: risk/qty follow the drawing to its synced copies */
+        if (d.syncId) pane.refreshPeers(DrawSync.onEdit(
+          (typeof Layout !== "undefined" && Layout.panes) || [], pane, d));
         toast("Trade Taker: qty " + plan.qty +
               (plan.orderType ? " (" + plan.orderType.replace("_", " ") + ")" : " (order type decided at Implement)") +
               (plan.valueSource === "fallback" ? " - broker values unavailable, XAUUSD fallback used" : ""));
@@ -5863,6 +6041,10 @@
           d.ticket = res.ticket || res.order || null;
           d.liveOrderType = res.order_type;
           pane.persist(); pane.draw(); pane.refreshObjBar();
+          /* drawing sync: the implemented state + ticket follow the drawing,
+             so every synced copy refuses Implement ("Already live") too */
+          if (d.syncId) pane.refreshPeers(DrawSync.onEdit(
+            (typeof Layout !== "undefined" && Layout.panes) || [], pane, d));
           toast(res.message || "Order placed");
           if (typeof playAlertSound === "function") playAlertSound();
         }).catch(function (e) {
@@ -6894,6 +7076,7 @@
   /* ================================================================= Layout */
   var Layout = {
     panes: [], activeId: 0, tool: "cursor", nPanes: 1, arrId: "full",
+    syncDrawings: true, /* drawing sync: layout-level toggle, default ON */
     savedVersion: "3.0", _dirty: false,
     /* Anything done on the chart (drawings, indicators, TF, symbol...) marks
        the layout dirty: an orange dot appears on the Save button. The Save
@@ -6904,6 +7087,16 @@
       this._dirty = true;
       var b = $("btn-savelayout");
       if (b) b.classList.add("dirty");
+    },
+
+    /* drawing sync toggle: persists with the layout; OFF means panes
+       behave exactly as before (independent drawings, no propagation) */
+    setSyncDrawings: function (v) {
+      this.syncDrawings = !!v;
+      DrawSync.enabled = this.syncDrawings;
+      var b = $("btn-syncdrawings");
+      if (b) b.classList.toggle("on", this.syncDrawings);
+      this.save();
     },
 
     init: function (status) {
@@ -6918,6 +7111,9 @@
           self.panes.push(new ChartPane(self.paneEl(i), i, ps, function () { self.markDirty(); }));
         });
         this.setActive(restored.active || 0);
+        /* old layouts have no flag: sync defaults ON */
+        this.syncDrawings = (restored.syncDrawings !== false);
+        DrawSync.enabled = this.syncDrawings;
       } else {
         /* default = two panes, both 1m candles, no indicators.
            (A saved layout in localStorage still takes precedence.)*/
@@ -7018,6 +7214,7 @@
           var saved = this.namedList();
           saved[this.current] = {
             v: "3.0", n: Layout.nPanes, arr: Layout.arrId, active: Layout.activeId,
+            syncDrawings: Layout.syncDrawings,
             panes: Layout.panes.map(function (p) { return p.serialize(); })
           };
           this.saveNamed(saved);
@@ -7081,6 +7278,7 @@
           Layout.save();
           saved[nm] = {
             v: "3.0", n: Layout.nPanes, arr: Layout.arrId, active: Layout.activeId,
+            syncDrawings: Layout.syncDrawings,
             panes: Layout.panes.map(function (p) { return p.serialize(); })
           };
           this.saveNamed(saved);
@@ -7100,6 +7298,17 @@
       /* Save button: one click writes the current layout silently - no popup.
          The orange dot on the button means unsaved changes exist.*/
       $("btn-savelayout").addEventListener("click", function () { Layout.save(true); });
+      /* drawing sync toggle (topbar, next to Save): layout-level, default ON */
+      var syncBtn = $("btn-syncdrawings");
+      if (syncBtn) {
+        syncBtn.classList.toggle("on", Layout.syncDrawings);
+        syncBtn.addEventListener("click", function () {
+          Layout.setSyncDrawings(!Layout.syncDrawings);
+          toast(Layout.syncDrawings ?
+            "Drawing sync on - drawings follow this symbol on all charts" :
+            "Drawing sync off - charts keep independent drawings");
+        });
+      }
       /* autosave: every 60s, persist whatever changed on the charts */
       setInterval(function () {
         if (Layout._dirty) {
@@ -7317,6 +7526,7 @@
       try {
         localStorage.setItem(LS_KEY, JSON.stringify({
           v: this.savedVersion, n: this.nPanes, arr: this.arrId, active: this.activeId,
+          syncDrawings: this.syncDrawings,
           panes: this.panes.map(function (p) { return p.serialize(); })
         }));
         this._dirty = false;
@@ -7406,6 +7616,7 @@
         var saved = self.namedList();
         saved[nm] = {
           v: "3.0", n: Layout.nPanes, arr: Layout.arrId, active: Layout.activeId,
+          syncDrawings: Layout.syncDrawings,
           panes: Layout.panes.map(function (p) { return p.serialize(); })
         };
         try { localStorage.setItem("stocksophist_named_layouts", JSON.stringify(saved)); } catch (e) {}
@@ -7441,6 +7652,11 @@
           JSON.parse(JSON.stringify(ps)), function () { Layout.markDirty(); }));
       }
       Layout.setActive(Math.min(s.active || 0, s.n - 1));
+      /* old snapshots have no flag: sync defaults ON */
+      Layout.syncDrawings = (s.syncDrawings !== false);
+      DrawSync.enabled = Layout.syncDrawings;
+      var sb = $("btn-syncdrawings");
+      if (sb) sb.classList.toggle("on", Layout.syncDrawings);
       Layout.save();
     }
   };
