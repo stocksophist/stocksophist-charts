@@ -76,10 +76,11 @@ import indicators as indlib  # noqa: E402 (library: built-ins + user scripts)
 from mt5trade import register_trade_routes  # noqa: E402 (direct chart trading)
 from trade_taker import register_tradetaker_routes  # noqa: E402 (Trade Taker tool)
 import alert_defs  # noqa: E402 (alert definitions + trigger log)
+import backtest as backtest_engine  # noqa: E402 (simulation only, no orders)
 from tickstore import TickVault  # noqa: E402 (local 1-second tick vault)
 import ops  # noqa: E402
 
-VERSION = "3.4.46"
+VERSION = "3.4.48"
 
 # import helper - server runs as `python app/server.py` (script mode,
 # no parent package, so `from . import x` fails) OR as `python -m app.server`.
@@ -593,7 +594,7 @@ def _post_webhook(url, kind, symbol, price, text):
         req = urllib.request.Request(
             url, data=payload,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "StockSophistCharts/3.4.46"},
+                     "User-Agent": "StockSophistCharts/3.4.48"},
             method="POST")
         with urllib.request.urlopen(req, timeout=10) as resp:
             code = getattr(resp, "status", 200)
@@ -4466,6 +4467,147 @@ def api_indicator(ind_id):
     if mode != "renko" and not upto:
         _ind_cache_put(ind_key, _ind_cache_sig(symbol, tf), result)
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Backtest (SIMULATION ONLY)
+#
+# POST /api/backtest/run computes a backtest over closed OHLC bars and
+# returns metrics, the trade ledger, equity curves, gate results, and
+# the full input snapshot. GET /api/backtest/trades exports the ledger
+# as CSV. Nothing here can place a live order: the route imports only
+# the pure backtest engine (no mt5trade, no trade_taker, no broker).
+# ---------------------------------------------------------------------------
+_BACKTEST_RUNS = {}
+_BACKTEST_RUNS_ORDER = []
+
+
+def _backtest_store(result):
+    import uuid as _uuid
+    rid = _uuid.uuid4().hex[:12]
+    _BACKTEST_RUNS[rid] = result
+    _BACKTEST_RUNS_ORDER.append(rid)
+    while len(_BACKTEST_RUNS_ORDER) > 5:
+        old = _BACKTEST_RUNS_ORDER.pop(0)
+        _BACKTEST_RUNS.pop(old, None)
+    return rid
+
+
+@app.route("/api/backtest/providers")
+def api_backtest_providers():
+    out = []
+    for pid, p in backtest_engine.PROVIDERS.items():
+        out.append({"id": pid, "name": p["name"],
+                    "needs_ticks": p["needs_ticks"], "htf": p["htf"],
+                    "settings_schema": p["settings_schema"]})
+    return jsonify({"providers": out})
+
+
+@app.route("/api/backtest/run", methods=["POST"])
+def api_backtest_run():
+    body = request.get_json(force=True, silent=True) or {}
+    symbol = (body.get("symbol") or "XAUUSD").strip() or "XAUUSD"
+    tf = body.get("tf") or "1m"
+    if tf not in _TF_SEC:
+        return jsonify({"error": "unknown timeframe"}), 400
+    bar_seconds = _TF_SEC[tf]
+    provider_id = body.get("provider") or "supertrend_flip"
+    provider = backtest_engine.PROVIDERS.get(provider_id)
+    if provider is None:
+        return jsonify({"error": "unknown backtest provider"}), 400
+    provider_settings = body.get("provider_settings") or {}
+    try:
+        bars = _deep_history(symbol, tf)
+    except Exception as e:
+        return jsonify({"error": "history load failed: %s" % e}), 500
+    bars = [{"time": int(b["time"]), "open": float(b["open"]),
+             "high": float(b["high"]), "low": float(b["low"]),
+             "close": float(b["close"])} for b in (bars or [])]
+    start = body.get("start")
+    end = body.get("end")
+    if start is not None:
+        bars = [b for b in bars if b["time"] >= int(start)]
+    if end is not None:
+        bars = [b for b in bars if b["time"] <= int(end)]
+    # Forming/last incomplete bar excluded: the engine must only ever
+    # see closed bars.
+    bars = backtest_engine.drop_forming_bar(bars, int(time.time()),
+                                            bar_seconds)
+    if len(bars) < 2:
+        return jsonify({"error": "not enough closed bars in range"}), 400
+    # Repaint/lookahead gate FIRST: a failing provider refuses the run.
+    gate = backtest_engine.repaint_gate(
+        lambda bs: provider["fn"](bs, provider_settings), bars)
+    if not gate["passed"]:
+        return jsonify({"error": "provider failed the repaint/lookahead "
+                                 "gate and is not backtestable",
+                        "gate": gate}), 422
+    cfg = dict(body.get("config") or {})
+    cfg["symbol"] = symbol
+    cfg["tf"] = tf
+    cfg["bar_seconds"] = bar_seconds
+    try:
+        events, warmup = provider["fn"](bars, provider_settings)
+        cfg["warmup_bars"] = warmup
+        result = backtest_engine.run_backtest(bars, events, cfg,
+                                              provider_name=provider_id)
+    except ValueError as e:
+        return jsonify({"error": "invalid backtest config: %s" % e}), 400
+    except Exception as e:
+        return jsonify({"error": "backtest failed: %s" % e}), 500
+    # History quality: expected bar count vs actual in the range.
+    quality = None
+    missing = None
+    if bars:
+        span = bars[-1]["time"] - bars[0]["time"]
+        expected = span // bar_seconds + 1
+        if 0 < expected <= 2000000:
+            present = {b["time"] for b in bars}
+            missing = expected - len(present)
+            quality = round(min(100.0, len(present) * 100.0 / expected), 2)
+    result["gate"] = gate
+    result["history_quality"] = {"quality_pct": quality,
+                                 "missing_bars": missing,
+                                 "bars": len(bars)}
+    result["provider_settings"] = provider_settings
+    robust = {}
+    try:
+        if body.get("walk_forward"):
+            robust["walk_forward"] = backtest_engine.walk_forward(
+                bars, events, result["snapshot"])
+        if body.get("sweep"):
+            robust["sweep"] = backtest_engine.parameter_sweep(
+                bars, events, result["snapshot"])
+        if body.get("monte_carlo"):
+            robust["monte_carlo"] = backtest_engine.monte_carlo(
+                result["trades"], result["snapshot"]["initial_capital"],
+                paths=1000, seed=42, skip_pct=0.10)
+        if body.get("cost_stress"):
+            robust["cost_stress"] = backtest_engine.cost_stress(
+                bars, events, result["snapshot"])
+    except Exception as e:
+        robust["error"] = "robustness failed: %s" % e
+    result["robustness"] = robust
+    rid = _backtest_store(result)
+    result["run_id"] = rid
+    return jsonify(result)
+
+
+@app.route("/api/backtest/trades")
+def api_backtest_trades():
+    rid = request.args.get("run", "")
+    result = _BACKTEST_RUNS.get(rid)
+    if result is None:
+        return jsonify({"error": "unknown or expired run id"}), 404
+    if (request.args.get("format") or "") == "csv":
+        csv_text = backtest_engine.ledger_to_csv(result)
+        resp = make_response(csv_text)
+        resp.headers["Content-Type"] = "text/csv"
+        resp.headers["Content-Disposition"] = (
+            "attachment; filename=backtest_%s.csv" % rid)
+        return resp
+    return jsonify({"run_id": rid, "trades": result["trades"],
+                    "legs": result["legs"]})
 
 
 @app.route("/api/indicators/add", methods=["POST"])

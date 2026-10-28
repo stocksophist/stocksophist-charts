@@ -22,7 +22,7 @@
   var TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   var ALERT_TF_LIST = ["1s", "15s", "1m", "3m", "5m", "15m", "30m", "1H", "4H", "D", "W", "M"];
   // premium-style deep history targets (bars) per timeframe
-  var APP_VERSION = "3.4.46";  // must match server VERSION; mismatch banner on load
+  var APP_VERSION = "3.4.48";  // must match server VERSION; mismatch banner on load
   var DEEP_BARS = { "1s": 7200, "15s": 5760,
                     "1m": 20000, "3m": 20000, "5m": 20000,
                     "15m": 20000, "30m": 20000, "1H": 20000, "4H": 20000,
@@ -7074,6 +7074,308 @@
   };
 
   /* ================================================================= Layout */
+  /* ================================================== backtest panel
+     Simulation only: replays an indicator signal over closed bars and
+     reports metrics, ledger, equity curve and robustness checks. It
+     never places a live order (the server route imports only the pure
+     engine). English-only UI. */
+  var Backtest = {
+    _ov: null, _last: null,
+    _f: function (id) { return this._ov ? this._ov.querySelector("[data-bt='" + id + "']") : null; },
+    _num: function (id, dflt) {
+      var el = this._f(id), v = el ? parseFloat(el.value) : NaN;
+      return isFinite(v) ? v : dflt;
+    },
+    _int: function (id, dflt) {
+      var el = this._f(id), v = el ? parseInt(el.value, 10) : NaN;
+      return isFinite(v) ? v : dflt;
+    },
+    _money: function (x) {
+      if (x === null || x === undefined || !isFinite(x)) return "-";
+      return (x < 0 ? "-$" : "$") + Math.abs(x).toFixed(2);
+    },
+    _pct: function (x) {
+      if (x === null || x === undefined || !isFinite(x)) return "-";
+      return (x * 100).toFixed(1) + "%";
+    },
+    _t: function (unix) {
+      if (!unix) return "-";
+      try { return new Date(unix * 1000).toLocaleString(); } catch (e) { return String(unix); }
+    },
+    open: function () {
+      this.close();
+      var sym = "XAUUSD";
+      try { sym = ((Layout.panes[Layout.activeId] || {}).state || {}).symbol || "XAUUSD"; } catch (e) {}
+      var ov = document.createElement("div");
+      ov.className = "txtdlg-ov";
+      ov.innerHTML =
+        '<div class="txtdlg" role="dialog" aria-label="Backtest" style="width:94vw;max-width:960px;max-height:92vh;overflow:auto">' +
+        '<div class="th">Backtest (simulation only - never places a live order)</div>' +
+        '<div class="tb">' +
+        '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-size:12px">' +
+        '<label>Symbol<br><input data-bt="symbol" type="text" value="' + escHtml(sym) + '"></label>' +
+        '<label>Timeframe<br><select data-bt="tf"><option>1m</option><option>3m</option><option>5m</option><option>15m</option><option>30m</option><option>1H</option><option>4H</option><option>D</option></select></label>' +
+        '<label>Start (optional)<br><input data-bt="start" type="datetime-local"></label>' +
+        '<label>End (optional)<br><input data-bt="end" type="datetime-local"></label>' +
+        '<label>Indicator<br><select data-bt="provider"><option value="supertrend_flip">Supertrend flip (reference)</option></select></label>' +
+        '<label>ATR length<br><input data-bt="st-length" type="number" value="10"></label>' +
+        '<label>Multiplier<br><input data-bt="st-mult" type="number" step="0.1" value="3.0"></label>' +
+        '<label>Capital ($)<br><input data-bt="capital" type="number" value="10000"></label>' +
+        '<label>Sizing<br><select data-bt="sizing"><option value="risk">Risk per trade</option><option value="fixed">Fixed lot</option></select></label>' +
+        '<label>Risk ($)<br><input data-bt="risk" type="number" value="100"></label>' +
+        '<label>Fixed lot<br><input data-bt="fixedqty" type="number" step="0.01" value="0.01"></label>' +
+        '<label>SL mode<br><select data-bt="slmode"><option value="price">Fixed price distance</option><option value="atr">ATR multiple</option></select></label>' +
+        '<label>SL distance / ATR mult<br><input data-bt="slvalue" type="number" step="0.1" value="5.0"></label>' +
+        '<label>SL ATR length<br><input data-bt="slatrlen" type="number" value="14"></label>' +
+        '<label><br><input data-bt="playbook" type="checkbox" checked> Playbook: 75% at 3R, runner on trail</label>' +
+        '<label>TP1 RR<br><input data-bt="tp1rr" type="number" step="0.1" value="3.0"></label>' +
+        '<label>TP1 fraction<br><input data-bt="tp1frac" type="number" step="0.05" value="0.75"></label>' +
+        '<label>Trailing<br><select data-bt="trail"><option value="none">None</option><option value="fixed">Fixed distance</option><option value="pct">Percentage</option><option value="atr">ATR multiple</option></select></label>' +
+        '<label>Trail distance / mult<br><input data-bt="traildist" type="number" step="0.1" value="5.0"></label>' +
+        '<label>Trail ATR mult<br><input data-bt="trailatrmult" type="number" step="0.1" value="2.0"></label>' +
+        '<label>Trail activation (R, blank = none)<br><input data-bt="activation" type="number" step="0.1" placeholder="none"></label>' +
+        '<label>Trail trigger<br><select data-bt="trigger"><option value="range">On range (bar high/low)</option><option value="close">On close only</option></select></label>' +
+        '<label><br><input data-bt="breakeven" type="checkbox"> Breakeven stop after TP1</label>' +
+        '<label>Exit timing (C2C)<br><select data-bt="c2c"><option value="next_open">Next bar open (conservative)</option><option value="same_close">Same bar close (optimistic)</option></select></label>' +
+        '<label>Opposite signal<br><select data-bt="opposite"><option value="close">Close position</option><option value="reverse">Reverse position</option><option value="off">Ignore</option></select></label>' +
+        '<label>Max bars (blank = none)<br><input data-bt="maxbars" type="number" placeholder="none"></label>' +
+        '<label>Flat at close after N bars<br><input data-bt="closeexit" type="number" placeholder="none"></label>' +
+        '<label>Commission ($ per fill)<br><input data-bt="comm" type="number" step="0.01" value="0.50"></label>' +
+        '<label>Slippage (price units)<br><input data-bt="slip" type="number" step="0.01" value="0.10"></label>' +
+        '<label>Direction<br><select data-bt="direction"><option value="both">Long + Short</option><option value="long">Long only</option><option value="short">Short only</option></select></label>' +
+        '</div>' +
+        '<div style="margin-top:10px;font-size:12px;display:flex;gap:14px;flex-wrap:wrap">' +
+        '<label><input data-bt="rb-wf" type="checkbox" checked> Walk-forward split</label>' +
+        '<label><input data-bt="rb-sweep" type="checkbox" checked> Parameter sweep (+/-10-20%)</label>' +
+        '<label><input data-bt="rb-mc" type="checkbox" checked> Monte Carlo (1,000 paths)</label>' +
+        '<label><input data-bt="rb-cost" type="checkbox" checked> Cost stress (2x, 3x)</label>' +
+        '</div>' +
+        '<div style="margin-top:10px"><button class="ok" data-bt="run">Run backtest</button> ' +
+        '<span data-bt="status" style="font-size:12px;color:var(--text-dim)"></span></div>' +
+        '<div data-bt="results" style="margin-top:12px"></div>' +
+        '</div>' +
+        '<div class="tf"><button class="cancel" data-bt="close">Close</button></div></div>';
+      document.body.appendChild(ov);
+      this._ov = ov;
+      var self = this;
+      ov.querySelector("[data-bt='close']").addEventListener("click", function () { self.close(); });
+      ov.addEventListener("mousedown", function (e) { if (e.target === ov) self.close(); });
+      ov.querySelector("[data-bt='run']").addEventListener("click", function () { self.run(); });
+      fetch("/api/backtest/providers").then(function (r) { return r.json(); }).then(function (j) {
+        var sel = self._f("provider");
+        if (!sel || !j.providers) return;
+        sel.innerHTML = j.providers.map(function (p) {
+          return '<option value="' + escHtml(p.id) + '">' + escHtml(p.name) + '</option>';
+        }).join("");
+      }).catch(function () {});
+    },
+    close: function () {
+      if (this._ov && this._ov.parentNode) this._ov.parentNode.removeChild(this._ov);
+      this._ov = null;
+    },
+    run: function () {
+      var self = this, st = this._f("status"), out = this._f("results");
+      if (st) st.textContent = "Running...";
+      if (out) out.innerHTML = "";
+      function dtVal(id) {
+        var el = self._f(id);
+        if (!el || !el.value) return null;
+        var t = new Date(el.value).getTime();
+        return isFinite(t) ? Math.floor(t / 1000) : null;
+      }
+      var trail = this._f("trail").value;
+      var cfg = {
+        initial_capital: this._num("capital", 10000),
+        direction: this._f("direction").value,
+        sizing: this._f("sizing").value === "fixed"
+          ? { mode: "fixed", fixed_qty: this._num("fixedqty", 0.01) }
+          : { mode: "risk", risk_usd: this._num("risk", 100) },
+        sl: this._f("slmode").value === "atr"
+          ? { mode: "atr", atr_length: this._int("slatrlen", 14), atr_mult: this._num("slvalue", 2.0) }
+          : { mode: "price", value: this._num("slvalue", 5.0) },
+        playbook: !!this._f("playbook").checked,
+        tp_legs: [{ rr: this._num("tp1rr", 3.0), fraction: this._num("tp1frac", 0.75) }],
+        trailing: { type: trail, distance: this._num("traildist", 5.0),
+          atr_length: 14, atr_mult: this._num("trailatrmult", 2.0),
+          activation: (function () { var v = parseFloat(self._f("activation").value); return isFinite(v) ? v : null; })(),
+          activation_unit: "R", anchor: "entry", trigger: this._f("trigger").value },
+        breakeven_after_tp1: !!this._f("breakeven").checked,
+        c2c_timing: this._f("c2c").value,
+        opposite_exit: this._f("opposite").value,
+        max_bars: (function () { var v = parseInt(self._f("maxbars").value, 10); return isFinite(v) ? v : null; })(),
+        close_exit_bars: (function () { var v = parseInt(self._f("closeexit").value, 10); return isFinite(v) ? v : null; })(),
+        commission: { type: "per_order", value: this._num("comm", 0.50) },
+        slippage: this._num("slip", 0.10),
+        point: 0.01, tick_value: 1.0
+      };
+      var body = {
+        symbol: this._f("symbol").value.trim() || "XAUUSD",
+        tf: this._f("tf").value,
+        start: dtVal("start"), end: dtVal("end"),
+        provider: this._f("provider").value,
+        provider_settings: { length: this._int("st-length", 10), mult: this._num("st-mult", 3.0) },
+        config: cfg,
+        walk_forward: !!this._f("rb-wf").checked,
+        sweep: !!this._f("rb-sweep").checked,
+        monte_carlo: !!this._f("rb-mc").checked,
+        cost_stress: !!this._f("rb-cost").checked
+      };
+      fetch("/api/backtest/run", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body) })
+        .then(function (r) { return r.text().then(function (t) {
+          var j = null; try { j = JSON.parse(t); } catch (e) {}
+          if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+          return j;
+        }); })
+        .then(function (j) {
+          self._last = j;
+          if (st) st.textContent = "Done: " + j.bars + " bars, " + (j.trades ? j.trades.length : 0) + " trades.";
+          if (out) out.innerHTML = self.renderResults(j);
+        })
+        .catch(function (e) {
+          if (st) st.textContent = "Failed: " + e.message;
+          if (out) out.innerHTML = '<div style="color:#ef5350;font-size:13px">' + escHtml(e.message) +
+            '<br>Note: a repaint-gate failure (HTTP 422) means the indicator is not backtestable - its signals change on past bars.</div>';
+        });
+    },
+    _metricCard: function (label, val) {
+      return '<div style="border:1px solid var(--border-strong);border-radius:6px;padding:8px">' +
+        '<div style="font-size:11px;color:var(--text-dim)">' + escHtml(label) + '</div>' +
+        '<div style="font-size:16px;font-weight:600">' + escHtml(String(val)) + '</div></div>';
+    },
+    _svgCurve: function (eq, bh) {
+      if (!eq || eq.length < 2) return "<div>No equity curve (no bars).</div>";
+      var W = 900, H = 220, PAD = 8, i, v, min = Infinity, max = -Infinity;
+      function push(p) { if (isFinite(p.equity)) { min = Math.min(min, p.equity); max = Math.max(max, p.equity); } }
+      eq.forEach(push); (bh || []).forEach(push);
+      if (!isFinite(min)) return "<div>No equity curve.</div>";
+      var span = (max - min) || 1;
+      function pts(series) {
+        return series.map(function (p, idx) {
+          var x = PAD + idx / (series.length - 1) * (W - 2 * PAD);
+          var y = PAD + (1 - (p.equity - min) / span) * (H - 2 * PAD);
+          return x.toFixed(1) + "," + y.toFixed(1);
+        }).join(" ");
+      }
+      return '<svg width="100%" viewBox="0 0 ' + W + ' ' + H + '" style="background:var(--bg-input);border-radius:6px">' +
+        '<polyline fill="none" stroke="#888" stroke-width="1" stroke-dasharray="4 3" points="' + pts(bh || []) + '"/>' +
+        '<polyline fill="none" stroke="#26a69a" stroke-width="1.5" points="' + pts(eq) + '"/></svg>' +
+        '<div style="font-size:11px;color:var(--text-dim)">Teal = strategy equity. Grey dashed = buy-and-hold. Range ' +
+        this._money(min) + ' to ' + this._money(max) + '.</div>';
+    },
+    renderResults: function (j) {
+      var self = this, m = j.metrics || {}, s = j.splits || {};
+      var gate = j.gate || {};
+      var h = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">' +
+        '<span style="padding:3px 8px;border-radius:10px;background:' + (gate.passed ? '#1b5e20' : '#7f0000') + ';color:#fff;font-size:12px">Repaint gate: ' +
+        (gate.passed ? 'PASS' : 'FAIL') + (gate.checked ? ' (' + gate.checked.length + ' truncation points checked)' : '') + '</span>' +
+        '<span style="padding:3px 8px;border-radius:10px;background:#333;color:#fff;font-size:12px">History quality: ' +
+        ((j.history_quality || {}).quality_pct !== null && (j.history_quality || {}).quality_pct !== undefined ? (j.history_quality || {}).quality_pct + '%' : 'n/a') +
+        ' (' + j.bars + ' bars)</span>' +
+        '<span style="padding:3px 8px;border-radius:10px;background:#333;color:#fff;font-size:12px">C2C: ' + escHtml((j.snapshot || {}).c2c_timing || '') + '</span>' +
+        '</div>';
+      h += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-size:12px">' +
+        this._metricCard("Net profit", this._money(m.net)) +
+        this._metricCard("Trades / Win rate", (m.trades || 0) + " / " + this._pct(m.win_rate)) +
+        this._metricCard("Profit factor", m.profit_factor === null || m.profit_factor === undefined ? "n/a (no losses)" : m.profit_factor.toFixed(2)) +
+        this._metricCard("Expectancy", this._money(m.expectancy_usd) + " / " + (m.expectancy_r === null || m.expectancy_r === undefined ? "-" : m.expectancy_r.toFixed(2) + " R")) +
+        this._metricCard("Max drawdown (worse basis)", this._money(m.max_dd_usd) + " (" + this._pct(m.max_dd_pct) + ")") +
+        this._metricCard("Max DD intrabar", this._money((m.dd_intrabar || {}).max_dd_usd) + " / close-to-close " + this._money((m.dd_close || {}).max_dd_usd)) +
+        this._metricCard("Recovery / Calmar", (m.recovery_factor === null || m.recovery_factor === undefined ? "-" : m.recovery_factor.toFixed(2)) + " / " + (m.calmar === null || m.calmar === undefined ? "-" : m.calmar.toFixed(2))) +
+        this._metricCard("Sharpe / Sortino", (m.sharpe === null || m.sharpe === undefined ? "-" : m.sharpe.toFixed(2)) + " / " + (m.sortino === null || m.sortino === undefined ? "-" : m.sortino.toFixed(2))) +
+        this._metricCard("Win / loss streak", (m.max_win_streak || 0) + " (" + this._money(m.max_win_streak_usd) + ") / " + (m.max_loss_streak || 0) + " (" + this._money(m.max_loss_streak_usd) + ")") +
+        this._metricCard("Avg MFE / MAE", this._money(m.avg_mfe) + " / " + this._money(m.avg_mae)) +
+        this._metricCard("Buy-and-hold return", m.buy_hold_return_pct === null || m.buy_hold_return_pct === undefined ? "-" : m.buy_hold_return_pct.toFixed(1) + "%") +
+        this._metricCard("CAGR", m.cagr === null || m.cagr === undefined ? "-" : (m.cagr * 100).toFixed(1) + "%") +
+        '</div>';
+      h += '<h4 style="margin:14px 0 6px">Equity curve</h4>' + this._svgCurve(j.equity_curve, j.buy_hold_curve);
+      function splitRow(name, x) {
+        if (!x) return "";
+        return "<tr><td>" + escHtml(name) + "</td><td>" + (x.trades || 0) + "</td><td>" + self._pct(x.win_rate) +
+          "</td><td>" + self._money(x.net) + "</td><td>" + (x.profit_factor === null || x.profit_factor === undefined ? "-" : x.profit_factor.toFixed(2)) +
+          "</td><td>" + self._money(x.expectancy_usd) + "</td><td>" + (x.expectancy_r === null || x.expectancy_r === undefined ? "-" : x.expectancy_r.toFixed(2)) + "</td></tr>";
+      }
+      h += '<h4 style="margin:14px 0 6px">Splits</h4><table style="font-size:12px;border-collapse:collapse;width:100%">' +
+        '<tr><th align="left">Side</th><th>Trades</th><th>Win rate</th><th>Net</th><th>PF</th><th>Expect $</th><th>Expect R</th></tr>' +
+        splitRow("All", s.all) + splitRow("Long", s.long) + splitRow("Short", s.short) + '</table>';
+      var bd = j.exit_breakdown || {};
+      h += '<h4 style="margin:14px 0 6px">Exit reasons</h4><table style="font-size:12px;border-collapse:collapse">' +
+        '<tr><th align="left">Reason</th><th>Legs</th><th>Net</th></tr>';
+      Object.keys(bd).forEach(function (k) {
+        h += "<tr><td>" + escHtml(k) + "</td><td>" + bd[k].count + "</td><td>" + self._money(bd[k].net) + "</td></tr>";
+      });
+      h += '</table>';
+      var w = j.warnings || {};
+      var wbits = [];
+      if (w.gap_fills) wbits.push(w.gap_fills + " gap fills at open");
+      if (w.force_closes) wbits.push(w.force_closes + " force-closed at end of range");
+      if (w.unfilled_signals) wbits.push(w.unfilled_signals + " signals on the last bar (no fill bar)");
+      if (w.ignored_signals) wbits.push(w.ignored_signals + " signals ignored (same-side / direction filter / pending)");
+      if (w.skips && w.skips.length) wbits.push(w.skips.length + " entries skipped: " + escHtml(w.skips.map(function (x) { return x.reason; }).join("; ")));
+      if (w.negative_equity) wbits.push("WARNING: equity went negative (margin not modelled)");
+      if (wbits.length) h += '<div style="margin-top:10px;font-size:12px;color:#ffb300">' + wbits.join(" - ") + '</div>';
+      var trades = j.trades || [];
+      h += '<h4 style="margin:14px 0 6px">Trades (' + trades.length + (trades.length > 200 ? ', showing first 200' : '') + ')</h4>' +
+        '<div style="overflow:auto;max-height:320px"><table style="font-size:12px;border-collapse:collapse;width:100%">' +
+        '<tr><th>#</th><th>Side</th><th>Entry time</th><th>Entry</th><th>Qty</th><th>SL</th><th>Exit time</th><th>Net</th><th>R</th><th>MFE</th><th>MAE</th><th>Bars</th><th>Reason</th><th>Forced</th></tr>';
+      trades.slice(0, 200).forEach(function (t) {
+        h += "<tr><td>" + t.index + "</td><td>" + escHtml(t.side) + "</td><td>" + escHtml(self._t(t.entry_time)) +
+          "</td><td>" + t.entry_price.toFixed(2) + "</td><td>" + t.qty_initial.toFixed(2) + "</td><td>" + t.sl_price.toFixed(2) +
+          "</td><td>" + escHtml(self._t(t.exit_time)) + "</td><td>" + self._money(t.net) + "</td><td>" + t.r.toFixed(2) +
+          "</td><td>" + self._money(t.mfe) + "</td><td>" + self._money(t.mae) + "</td><td>" + t.duration_bars +
+          "</td><td>" + escHtml(t.final_reason) + "</td><td>" + (t.force_closed ? "yes" : "") + "</td></tr>";
+      });
+      h += '</table></div>';
+      var rb = j.robustness || {};
+      if (rb.walk_forward) {
+        var wf = rb.walk_forward;
+        h += '<h4 style="margin:14px 0 6px">Walk-forward (in-sample / out-of-sample)</h4><div style="font-size:12px">Split at bar ' + wf.split_bar +
+          ' (' + Math.round(wf.split_ratio * 100) + '%). In-sample: ' + (wf.in_sample.metrics.trades || 0) + ' trades, net ' +
+          this._money(wf.in_sample.metrics.net) + '. Out-of-sample: ' + (wf.out_of_sample.metrics.trades || 0) + ' trades, net ' +
+          this._money(wf.out_of_sample.metrics.net) + '. In-sample-only results are never quoted as evidence.</div>';
+      }
+      if (rb.sweep) {
+        var sw = rb.sweep;
+        h += '<h4 style="margin:14px 0 6px">Parameter sweep (stability share: ' +
+          (sw.stability_share === null || sw.stability_share === undefined ? "-" : (sw.stability_share * 100).toFixed(0) + "%") +
+          ' of ' + sw.total_variants + ' variants profitable)</h4><table style="font-size:12px;border-collapse:collapse">' +
+          '<tr><th align="left">Parameter</th><th>Factor</th><th>Net</th><th>Win rate</th><th>Max DD</th></tr>';
+        sw.variants.forEach(function (v) {
+          h += "<tr><td>" + escHtml(v.param) + "</td><td>" + v.factor + "</td><td>" + self._money(v.net) +
+            "</td><td>" + self._pct(v.win_rate) + "</td><td>" + self._money(v.max_dd_usd) + "</td></tr>";
+        });
+        h += '</table>';
+      }
+      if (rb.monte_carlo) {
+        var mc = rb.monte_carlo;
+        h += '<h4 style="margin:14px 0 6px">Monte Carlo (' + mc.paths + ' paths, seed ' + mc.seed + ')</h4><div style="font-size:12px">Median final equity ' +
+          this._money(mc.median_final) + '. P5 worst-case final equity ' + this._money(mc.p5_final) + '. P95 max drawdown ' + this._money(mc.p95_max_dd) + '.' +
+          (mc.skip_variant ? ' With 10% random trade skipping: median ' + this._money(mc.skip_variant.median_final) +
+          ', P5 ' + this._money(mc.skip_variant.p5_final) + ', P95 DD ' + this._money(mc.skip_variant.p95_max_dd) + '.' : '') +
+          ' Size live positions to survive the P5 case, not the median.</div>';
+      }
+      if (rb.cost_stress) {
+        h += '<h4 style="margin:14px 0 6px">Cost stress</h4><table style="font-size:12px;border-collapse:collapse">' +
+          '<tr><th>Cost multiplier</th><th>Net</th><th>Win rate</th><th>Max DD</th></tr>';
+        rb.cost_stress.forEach(function (r) {
+          h += "<tr><td>" + r.cost_multiplier + "x</td><td>" + self._money(r.net) + "</td><td>" + self._pct(r.win_rate) +
+            "</td><td>" + self._money(r.max_dd_usd) + "</td></tr>";
+        });
+        h += '</table><div style="font-size:12px">A rule that only wins at base or zero costs is not an edge.</div>';
+      }
+      if (rb.error) h += '<div style="font-size:12px;color:#ef5350">' + escHtml(rb.error) + '</div>';
+      h += '<div style="margin-top:12px;font-size:12px"><a href="/api/backtest/trades?run=' + escHtml(j.run_id || '') +
+        '&format=csv" target="_blank" rel="noopener">Download full trade ledger (CSV, all columns)</a></div>';
+      h += '<div style="margin-top:8px;font-size:11px;color:var(--text-dim)">Assumptions: ' + escHtml(j.assumptions || '') + '</div>';
+      h += '<details style="margin-top:8px;font-size:11px"><summary>Input snapshot (full config)</summary><pre style="white-space:pre-wrap">' +
+        escHtml(JSON.stringify(j.snapshot || {}, null, 2)) + '</pre></details>';
+      h += '<div style="margin-top:8px;font-size:11px;color:var(--text-dim)">Backtest results are logic proofs on historical bars, not a live-trading guarantee. ' +
+        'OHLC intrabar paths are modelled, not observed. Verify on DEMO before any live use.</div>';
+      return h;
+    }
+  };
+
   var Layout = {
     panes: [], activeId: 0, tool: "cursor", nPanes: 1, arrId: "full",
     syncDrawings: true, /* drawing sync: layout-level toggle, default ON */
@@ -7298,6 +7600,9 @@
       /* Save button: one click writes the current layout silently - no popup.
          The orange dot on the button means unsaved changes exist.*/
       $("btn-savelayout").addEventListener("click", function () { Layout.save(true); });
+      /* backtest panel (topbar, next to Sync drawings) */
+      var btBtn = $("btn-backtest");
+      if (btBtn) btBtn.addEventListener("click", function () { Backtest.open(); });
       /* drawing sync toggle (topbar, next to Save): layout-level, default ON */
       var syncBtn = $("btn-syncdrawings");
       if (syncBtn) {
